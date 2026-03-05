@@ -53,6 +53,8 @@ class ReportWorker:
     
     def start(self):
         """Start the worker"""
+        print("DEBUG: start() called", file=sys.stderr, flush=True)
+        
         logger.info("=" * 80)
         logger.info(f"🚀 Starting {self.worker_name}")
         logger.info("=" * 80)
@@ -67,17 +69,32 @@ class ReportWorker:
         
         # Validate configuration
         try:
+            print("DEBUG: Validating configuration...", file=sys.stderr, flush=True)
             settings.validate()
             logger.info("✅ Configuration validated")
+            print("DEBUG: Configuration validated", file=sys.stderr, flush=True)
         except ValueError as e:
             logger.error(f"❌ Configuration validation failed: {e}")
+            print(f"ERROR: Configuration validation failed: {e}", file=sys.stderr, flush=True)
             sys.exit(1)
         
         # Initialize services
-        self._initialize_services()
+        try:
+            print("DEBUG: About to initialize services...", file=sys.stderr, flush=True)
+            self._initialize_services()
+            print("DEBUG: Services initialized successfully", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"ERROR: During InitializationError: {e}", file=sys.stderr, flush=True)
+            logger.error(f"❌ Fatal error during initialization: {e}", exc_info=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            self.stop()
+            sys.exit(1)
         
+        print("DEBUG: Setting running = True", file=sys.stderr, flush=True)
         self.running = True
         
+        print("DEBUG: About to enter polling loop...", file=sys.stderr, flush=True)
         try:
             self._run_loop()
         except KeyboardInterrupt:
@@ -85,6 +102,7 @@ class ReportWorker:
             self.stop()
         except Exception as e:
             logger.error(f"❌ Fatal error: {e}", exc_info=True)
+            print(f"ERROR: Fatal error in run_loop: {e}", file=sys.stderr, flush=True)
             self.stop()
             sys.exit(1)
     
@@ -92,38 +110,56 @@ class ReportWorker:
         """Initialize all services"""
         try:
             logger.info("🔧 Initializing services...")
+            print("DEBUG: [1/5] Getting SQS service...", file=sys.stderr, flush=True)
             
             # SQS Service
             self.sqs_service = get_sqs_service()
+            print("DEBUG: [2/5] SQS service ready", file=sys.stderr, flush=True)
             logger.info("   ✅ SQS Service ready")
             
+            print("DEBUG: [3/5] Getting Database service...", file=sys.stderr, flush=True)
             # Database Service
             self.database_service = get_database_service()
+            print("DEBUG: [4/5] Database service ready", file=sys.stderr, flush=True)
             logger.info("   ✅ Database Service ready")
             
+            print("DEBUG: [5/5] Getting Webhook service...", file=sys.stderr, flush=True)
             # Webhook Service
             self.webhook_service = get_webhook_service()
+            print("DEBUG: [6/5] Webhook service ready", file=sys.stderr, flush=True)
             
             # Test webhook connectivity
             if self.webhook_service.test_connection():
                 logger.info("   ✅ Webhook Service ready")
             else:
                 logger.warning("   ⚠️ Webhook Service initialized but endpoint not reachable")
+            print("DEBUG: [7/5] About to get Report Analysis service...", file=sys.stderr, flush=True)
             
             # Report Analysis Service
             self.report_service = get_report_analysis_service(self.database_service)
+            print("DEBUG: [8/5] Report Analysis service ready", file=sys.stderr, flush=True)
             logger.info("   ✅ Report Analysis Service ready")
             
             logger.info("✅ All services initialized successfully")
+            print("DEBUG: All services initialized!", file=sys.stderr, flush=True)
             
         except Exception as e:
-            logger.error(f"❌ Failed to initialize services: {e}", exc_info=True)
+            error_msg = f"Failed to initialize services: {e}"
+            print(f"DEBUG ERROR: {error_msg}", file=sys.stderr, flush=True)
+            logger.error(f"❌ {error_msg}", exc_info=True)
+            import traceback
+            print("\n=== TRACEBACK ===", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            print("=== END TRACEBACK ===\n", file=sys.stderr, flush=True)
             raise
     
     def _run_loop(self):
         """Main worker loop - poll and process messages"""
+        print("[RUNNING] ENTERED WORKER LOOP - polling SQS...")
         logger.info("🔄 Worker started, polling for messages...")
         logger.info("")
+        
+        poll_count = 0
         
         while self.running:
             try:
@@ -133,9 +169,15 @@ class ReportWorker:
                     wait_time_seconds=settings.WAIT_TIME_SECONDS
                 )
                 
+                poll_count += 1
                 if not messages:
                     # No messages - continue polling
+                    if poll_count % 3 == 0:  # Log every 3rd poll (roughly every 60 seconds)
+                        logger.info(f"⏳ Waiting for messages... (poll #{poll_count})")
                     continue
+                
+                # Reset poll count when messages arrive
+                poll_count = 0
                 
                 # Process each message
                 for message in messages:
@@ -380,6 +422,7 @@ def signal_handler(signum, frame):
 
 def main():
     """Main entry point"""
+    print("[RUNNING] APP IS RUNNING...")
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -387,7 +430,6 @@ def main():
     # Create and start worker
     worker = ReportWorker()
     worker.start()
-
 
 if __name__ == "__main__":
     main()

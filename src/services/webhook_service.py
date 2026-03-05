@@ -3,6 +3,7 @@ Webhook service for sending results back to the API
 """
 
 import json
+import os
 import hmac
 import hashlib
 import requests
@@ -18,8 +19,9 @@ class WebhookService:
     """Service for sending webhooks"""
     
     def __init__(self):
-        self.base_url = settings.WEBHOOK_BASE_URL
-        self.secret = settings.WEBHOOK_SECRET
+        # Hardcode for local testing - TODO: remove in production
+        self.base_url = os.getenv('WEBHOOK_URL', 'http://localhost:8080/api/v1')
+        self.secret = os.getenv('WEBHOOK_SECRET') or settings.WEBHOOK_SECRET
         self.timeout = 30  # seconds
         
     def _generate_signature(self, payload: str) -> str:
@@ -52,6 +54,10 @@ class WebhookService:
         headers = {
             'Content-Type': 'application/json',
         }
+        
+        # Add authorization header if secret is configured
+        if self.secret:
+            headers['Authorization'] = f'Bearer {self.secret}'
         
         if signature:
             headers['X-Webhook-Signature'] = signature
@@ -105,7 +111,7 @@ class WebhookService:
             'metadata': metadata
         }
         
-        return self._send_webhook('/api/v1/webhooks/report-complete', payload)
+        return self._send_webhook('/webhooks/report-complete', payload)
     
     def send_report_failed(
         self,
@@ -134,7 +140,7 @@ class WebhookService:
             'errorDetails': error_details or {}
         }
         
-        return self._send_webhook('/api/v1/webhooks/report-failed', payload)
+        return self._send_webhook('/webhooks/report-failed', payload)
     
     def test_connection(self) -> bool:
         """Test webhook connectivity"""

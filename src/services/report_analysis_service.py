@@ -2,11 +2,12 @@
 Report Analysis Service - Core logic for analyzing presentation segments
 
 This service analyzes each transcript segment against slides and topic,
-calculating scores and generating issues/suggestions.
+calculating scores and generating issues/suggestions using Gemini AI.
 """
 
 import json
 import re
+import google.genai as genai
 from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 
@@ -31,6 +32,15 @@ class ReportAnalysisService:
         self.similarity_threshold = settings.SIMILARITY_THRESHOLD
         self.relevance_threshold = settings.RELEVANCE_THRESHOLD
         self.alignment_threshold = settings.ALIGNMENT_THRESHOLD
+        
+        # Initialize Gemini AI
+        if not settings.GEMINI_API_KEY:
+            raise AnalysisError("GEMINI_API_KEY is not configured")
+        
+        # Use new google.genai client
+        self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        self.model_name = settings.GEMINI_MODEL
+        logger.info(f"✅ Gemini AI initialized with model: {settings.GEMINI_MODEL}")
         
     def analyze_presentation(
         self, 
@@ -172,7 +182,7 @@ class ReportAnalysisService:
         total_segments: int
     ) -> SegmentAnalysisResult:
         """
-        Analyze a single transcript segment
+        Analyze a single transcript segment using Gemini AI
         
         Args:
             segment: Transcript segment data
@@ -186,71 +196,154 @@ class ReportAnalysisService:
             SegmentAnalysisResult
         """
         segment_id = segment.get('segmentId', 0)
-        segment_text = (segment.get('segmentText', '') or '').lower()
+        segment_text = segment.get('segmentText', '') or segment.get('content', '')
         start_time = float(segment.get('startTimestamp', 0) or 0)
         end_time = float(segment.get('endTimestamp', 0) or 0)
         
+        # Find current slide (from segment data or calculate)
+        current_slide_id = segment.get('slideId', 1)
+        current_slide_content = slide_contents.get(current_slide_id, '')
+        
+        # Prepare prompt for Gemini
+        prompt = f"""You are an expert presentation analyst. Analyze this transcript segment and return ONLY valid JSON (no markdown, no explanation).
+
+Presentation Context:
+- Topic Keywords: {', '.join(topic_keywords)}
+- Total Duration: {total_duration:.2f} seconds
+- Current Slide ID: {current_slide_id}
+- Total Segments: {total_segments}
+
+Segment Information:
+- Segment ID: {segment_id}
+- Start Time: {start_time:.2f}s
+- End Time: {end_time:.2f}s
+- Text: {segment_text}
+
+Slide Content (ID {current_slide_id}):
+{current_slide_content}
+
+Instructions:
+Analyze and return JSON with these exact fields:
+{{
+  "relevance_score": <0-100: how relevant segment is to topic>,
+  "semantic_score": <0-100: semantic quality and clarity of the narration>,
+  "alignment_score": <0-100: how well narration matches the current slide>,
+  "best_matching_slide": <slide ID that best matches this segment>,
+  "expected_slide_number": <expected slide number based on timing>,
+  "timing_deviation": <seconds early/late compared to ideal timing>,
+  "issues": [<array of issues found, empty if none>],
+  "suggestions": [<array of suggestions for improvement, empty if none>],
+  "topic_keywords_found": [<array of topic keywords found in this segment>]
+}}
+
+Return ONLY the JSON object. No markdown, no code blocks."""
+
+        try:
+            # Call Gemini API using new google.genai client
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
+            result_text = response.text.strip()
+            
+            # Clean up response (remove markdown if present)
+            if result_text.startswith('```'):
+                result_text = result_text.split('```')[1]
+                if result_text.startswith('json'):
+                    result_text = result_text[4:]
+            result_text = result_text.strip().strip('`')
+            
+            # Parse JSON
+            result = json.loads(result_text)
+            
+            # Map to SegmentAnalysisResult
+            return SegmentAnalysisResult(
+                segment_id=segment_id,
+                relevance_score=result.get('relevance_score', 50) / 100.0,
+                semantic_score=result.get('semantic_score', 50) / 100.0,
+                alignment_score=result.get('alignment_score', 50) / 100.0,
+                best_matching_slide=result.get('best_matching_slide', current_slide_id),
+                expected_slide_number=result.get('expected_slide_number', 1),
+                timing_deviation=float(result.get('timing_deviation', 0)),
+                issues=result.get('issues', []),
+                suggestions=result.get('suggestions', ['Good segment']),
+                topic_keywords_found=result.get('topic_keywords_found', topic_keywords[:5])
+            )
+            
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse Gemini response: {e}, using fallback")
+            return self._analyze_segment_fallback(segment, topic_keywords, slide_contents, slides, total_duration, total_segments, current_slide_id)
+        except Exception as e:
+            logger.warning(f"Gemini API error: {e}, using fallback")
+            return self._analyze_segment_fallback(segment, topic_keywords, slide_contents, slides, total_duration, total_segments, current_slide_id)
+    
+    def _analyze_segment_fallback(
+        self,
+        segment: Dict[str, Any],
+        topic_keywords: List[str],
+        slide_contents: Dict[int, str],
+        slides: List[Dict],
+        total_duration: float,
+        total_segments: int,
+        current_slide_id: int
+    ) -> SegmentAnalysisResult:
+        """Fallback analysis using rule-based method if AI fails"""
+        segment_id = segment.get('segmentId', 0)
+        segment_text = (segment.get('segmentText', '') or '').lower()
+        start_time = float(segment.get('startTimestamp', 0) or 0)
+        
         # Find topic keywords in segment
-        keywords_found = []
-        for keyword in topic_keywords:
-            if keyword.lower() in segment_text:
-                keywords_found.append(keyword)
+        keywords_found = [kw for kw in topic_keywords if kw.lower() in segment_text]
         
-        # Calculate relevance score (based on topic keyword coverage)
+        # Calculate relevance score
         relevance_score = len(keywords_found) / max(len(topic_keywords), 1) if topic_keywords else 0.5
-        relevance_score = min(relevance_score * 2, 1.0)  # Scale up
+        relevance_score = min(relevance_score * 2, 1.0)
         
-        # Find best matching slide (semantic similarity)
-        best_matching_slide = 0
+        # Find best matching slide
+        best_matching_slide = current_slide_id
         best_similarity = 0.0
         
         for slide_num, slide_content in slide_contents.items():
-            if not slide_content:
-                continue
-            
-            # Simple keyword-based similarity
-            keywords_in_slide = sum(1 for kw in keywords_found if kw in slide_content)
-            similarity = keywords_in_slide / max(len(keywords_found), 1) if keywords_found else 0
-            
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_matching_slide = slide_num
+            if slide_content:
+                keywords_in_slide = sum(1 for kw in keywords_found if kw in slide_content)
+                similarity = keywords_in_slide / max(len(keywords_found), 1) if keywords_found else 0
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_matching_slide = slide_num
         
         semantic_score = best_similarity
         
-        # Calculate expected slide number based on timing
+        # Expected slide number
         expected_slide_number = 1
         if total_duration > 0 and slides:
             progress = start_time / total_duration
             expected_slide_number = int(progress * len(slides)) + 1
             expected_slide_number = min(expected_slide_number, len(slides))
         
-        # Calculate timing deviation
         timing_deviation = abs(best_matching_slide - expected_slide_number)
         alignment_score = 1.0 - min(timing_deviation / max(len(slides), 1), 1.0)
         
-        # Generate issues and suggestions
+        # Issues and suggestions
         issues = []
         suggestions = []
         
         if relevance_score < self.relevance_threshold:
             issues.append(f"Low content relevance ({relevance_score:.2f})")
-            suggestions.append("Add more topic-relevant content to this segment")
+            suggestions.append("Add more topic-relevant content")
         
         if semantic_score < self.similarity_threshold:
-            issues.append(f"No matching slide content found")
-            suggestions.append("Ensure segment content aligns with current slide")
+            issues.append("No matching slide content found")
+            suggestions.append("Ensure segment content aligns with slide")
         
         if timing_deviation > 2:
-            issues.append(f"Slide timing mismatch (expected slide {expected_slide_number}, showing {best_matching_slide})")
+            issues.append(f"Slide timing mismatch")
             suggestions.append("Adjust slide timing to match narration")
         
         if not keywords_found:
-            issues.append("No topic keywords found in segment")
+            issues.append("No topic keywords found")
             suggestions.append("Include more topic-related vocabulary")
         
-        # Create result
-        result = SegmentAnalysisResult(
+        return SegmentAnalysisResult(
             segment_id=segment_id,
             relevance_score=round(relevance_score, 3),
             semantic_score=round(semantic_score, 3),
@@ -258,12 +351,10 @@ class ReportAnalysisService:
             best_matching_slide=best_matching_slide,
             expected_slide_number=expected_slide_number,
             timing_deviation=round(timing_deviation, 2),
-            issues=issues,
-            suggestions=suggestions if suggestions else ["Good segment alignment"],
+            issues=issues if issues else ["Good segment alignment"],
+            suggestions=suggestions if suggestions else ["Continue with good practices"],
             topic_keywords_found=keywords_found
         )
-        
-        return result
     
     def _calculate_overall_scores(
         self, 
@@ -320,6 +411,4 @@ def get_report_analysis_service(db_service: DatabaseService = None) -> ReportAna
         _report_analysis_service = ReportAnalysisService(db_service)
     return _report_analysis_service
 
-
-# Import for get_database_service
 from src.services.database_service import get_database_service

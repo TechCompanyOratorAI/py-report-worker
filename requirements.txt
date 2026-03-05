@@ -1,0 +1,20 @@
+# AWS
+boto3>=1.26.0
+botocore>=1.29.0
+
+# Database
+mysql-connector-python>=8.0.0
+PyMySQL>=1.1.0
+
+# Webhook
+requests>=2.28.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Utils
+python-dateutil>=2.8.0
+coloredlogs>=15.0.0
+
+# AI - Gemini
+google-genai>=1.0.0
