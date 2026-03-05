@@ -111,8 +111,6 @@ class ReportWorker:
         try:
             logger.info("🔧 Initializing services...")
             print("DEBUG: [1/5] Getting SQS service...", file=sys.stderr, flush=True)
-            
-            # SQS Service
             self.sqs_service = get_sqs_service()
             print("DEBUG: [2/5] SQS service ready", file=sys.stderr, flush=True)
             logger.info("   ✅ SQS Service ready")
@@ -171,15 +169,10 @@ class ReportWorker:
                 
                 poll_count += 1
                 if not messages:
-                    # No messages - continue polling
-                    if poll_count % 3 == 0:  # Log every 3rd poll (roughly every 60 seconds)
+                    if poll_count % 3 == 0:  
                         logger.info(f"⏳ Waiting for messages... (poll #{poll_count})")
                     continue
-                
-                # Reset poll count when messages arrive
                 poll_count = 0
-                
-                # Process each message
                 for message in messages:
                     self._process_message(message)
                 
@@ -300,7 +293,7 @@ class ReportWorker:
             Dictionary with analysis results
         """
         # Step 1: Get presentation data
-        logger.info(f"📥 Step 1/4: Loading presentation data...")
+        logger.info(f"📥 Step 1/5: Loading presentation data...")
         presentation_data = self.database_service.get_presentation_data(presentation_id)
         
         if not presentation_data:
@@ -315,7 +308,7 @@ class ReportWorker:
             raise AnalysisError("No transcript segments found for analysis")
         
         # Step 2: Perform analysis
-        logger.info(f"🔍 Step 2/4: Performing segment analysis...")
+        logger.info(f"🔍 Step 2/5: Performing segment analysis...")
         
         segment_analyses_obj, overall_scores_obj = self.report_service.analyze_presentation(presentation_data)
         
@@ -343,7 +336,7 @@ class ReportWorker:
         }
         
         # Step 3: Save segment analyses to database
-        logger.info(f"💾 Step 3/4: Saving segment analyses to database...")
+        logger.info(f"💾 Step 3/5: Saving segment analyses to database...")
         
         for i, analysis in enumerate(segment_analyses_obj):
             # Get slide_id for best matching slide
@@ -364,14 +357,49 @@ class ReportWorker:
         
         # Step 4: Save overall results to database
         logger.info(f"💾 Step 4/4: Saving overall results to database...")
-        
+
         result_id = self.database_service.save_analysis_results(
-            presentation_id, 
+            presentation_id,
             overall_scores_obj,
             processing_time_seconds=round(segment_processing_time, 2),
             ai_model_version="report-worker-v1"
         )
         logger.info(f"   - Saved AnalysisResults: resultId={result_id}")
+
+        # Step 5: Generate and save AI feedback
+        logger.info(f"🤖 Step 5/5: Generating AI feedback...")
+
+        try:
+            # Get data for feedback generation
+            feedback_data = self.database_service.get_segment_analyses_for_feedback(presentation_id)
+
+            if feedback_data["segment_analyses"] and feedback_data["overall_scores"]:
+                # Generate feedback using Gemini
+                feedback_result = self.report_service.generate_feedback(
+                    presentation_title=presentation_data.title,
+                    topic_name=presentation_data.topic_name,
+                    topic_description=presentation_data.topic_description or "",
+                    segment_analyses=feedback_data["segment_analyses"],
+                    overall_scores=feedback_data["overall_scores"]
+                )
+
+                # Save feedback to database
+                feedback_id = self.database_service.save_feedback(
+                    presentation_id=presentation_id,
+                    rating=feedback_result['overall_score'],
+                    comments=feedback_result['comments'],
+                    feedback_type=feedback_result.get('feedback_type', 'ai_report'),
+                    reviewer_id=None,  # AI-generated
+                    is_visible_to_student=True
+                )
+
+                logger.info(f"   - Saved Feedback: feedbackId={feedback_id}, rating={feedback_result['overall_score']}")
+            else:
+                logger.warning(f"   - Skipped feedback generation: missing data")
+
+        except Exception as e:
+            logger.error(f"   - Failed to generate/save feedback: {e}")
+            # Don't fail the whole job if feedback generation fails
         
         # Format metadata
         result_metadata = {

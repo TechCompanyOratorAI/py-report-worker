@@ -357,15 +357,15 @@ Return ONLY the JSON object. No markdown, no code blocks."""
         )
     
     def _calculate_overall_scores(
-        self, 
+        self,
         segment_analyses: List[SegmentAnalysisResult]
     ) -> OverallScores:
         """
         Calculate overall scores from all segment analyses
-        
+
         Args:
             segment_analyses: List of segment analysis results
-            
+
         Returns:
             OverallScores object
         """
@@ -376,27 +376,264 @@ Return ONLY the JSON object. No markdown, no code blocks."""
                 slide_alignment=0.0,
                 overall_score=0.0
             )
-        
+
         # Calculate averages
         n = len(segment_analyses)
-        
+
         avg_relevance = sum(a.relevance_score for a in segment_analyses) / n
         avg_semantic = sum(a.semantic_score for a in segment_analyses) / n
         avg_alignment = sum(a.alignment_score for a in segment_analyses) / n
-        
+
         # Weighted overall score
         overall_score = (
             avg_relevance * 0.3 +
             avg_semantic * 0.3 +
             avg_alignment * 0.4
         )
-        
+
         return OverallScores(
             content_relevance=round(avg_relevance, 3),
             semantic_similarity=round(avg_semantic, 3),
             slide_alignment=round(avg_alignment, 3),
             overall_score=round(overall_score, 3)
         )
+
+    def generate_feedback(
+        self,
+        presentation_title: str,
+        topic_name: str,
+        topic_description: str,
+        segment_analyses: List[Dict],
+        overall_scores: Dict
+    ) -> Dict[str, Any]:
+        """
+        Generate comprehensive feedback using Gemini AI
+
+        Args:
+            presentation_title: Title of presentation
+            topic_name: Topic name
+            topic_description: Topic description
+            segment_analyses: List of segment analysis results from DB
+            overall_scores: Overall scores from AnalysisResults
+
+        Returns:
+            Dict with rating (1-5) and comments
+        """
+        logger.info("🤖 Generating feedback with Gemini AI...")
+
+        # Prepare summary data for prompt
+        # Take up to 10 segments (5 best, 5 worst) to keep prompt manageable
+        if len(segment_analyses) > 10:
+            sorted_by_score = sorted(
+                segment_analyses,
+                key=lambda x: x.get('relevanceScore', 0) + x.get('semanticScore', 0) + x.get('alignmentScore', 0)
+            )
+            worst_segments = sorted_by_score[:5]
+            best_segments = sorted_by_score[-5:]
+            selected_segments = worst_segments + best_segments
+        else:
+            selected_segments = segment_analyses
+
+        # Build segment summaries
+        segments_summary = []
+        for seg in selected_segments:
+            issues = seg.get('issues', [])
+            suggestions = seg.get('suggestions', [])
+            if isinstance(issues, str):
+                import json
+                try:
+                    issues = json.loads(issues)
+                except:
+                    issues = []
+            if isinstance(suggestions, str):
+                import json
+                try:
+                    suggestions = json.loads(suggestions)
+                except:
+                    suggestions = []
+
+            segments_summary.append({
+                'segment_id': seg.get('segmentId'),
+                'relevance_score': seg.get('relevanceScore', 0),
+                'semantic_score': seg.get('semanticScore', 0),
+                'alignment_score': seg.get('alignmentScore', 0),
+                'best_matching_slide': seg.get('bestMatchingSlide'),
+                'timing_deviation': seg.get('timingDeviation', 0),
+                'issues': issues[:3],  # Top 3 issues per segment
+                'suggestions': suggestions[:3],  # Top 3 suggestions
+                'segment_text': (seg.get('segmentText', '') or '')[:200]  # Truncate long text
+            })
+
+        # Count common issues and suggestions across all segments
+        all_issues = []
+        all_suggestions = []
+        for seg in segment_analyses:
+            issues = seg.get('issues', [])
+            suggestions = seg.get('suggestions', [])
+            if isinstance(issues, str):
+                import json
+                try:
+                    issues = json.loads(issues)
+                except:
+                    issues = []
+            if isinstance(suggestions, str):
+                import json
+                try:
+                    suggestions = json.loads(suggestions)
+                except:
+                    suggestions = []
+            all_issues.extend(issues)
+            all_suggestions.extend(suggestions)
+
+        # Get top issues and suggestions
+        from collections import Counter
+        top_issues = Counter(all_issues).most_common(5)
+        top_suggestions = Counter(all_suggestions).most_common(5)
+
+        prompt = f"""Bạn là một chuyên gia đánh giá bài thuyết trình. Hãy viết feedback tổng quan cho bài thuyết trình dựa trên dữ liệu phân tích dưới đây.
+
+Thông tin bài thuyết trình:
+- Tiêu đề: {presentation_title}
+- Chủ đề: {topic_name}
+- Mô tả chủ đề: {topic_description}
+
+Điểm tổng quan:
+- Overall Score: {overall_scores.get('overallScore', 0):.2f}/1.0
+- Content Relevance: {overall_scores.get('contentRelevance', 0):.2f}/1.0
+- Semantic Similarity: {overall_scores.get('semanticSimilarity', 0):.2f}/1.0
+- Slide Alignment: {overall_scores.get('slideAlignment', 0):.2f}/1.0
+
+Các vấn đề phổ biến nhất:
+{chr(10).join([f"- {issue[0]}" for issue in top_issues])}
+
+Các đề xuất cải thiện phổ biến nhất:
+{chr(10).join([f"- {suggestion[0]}" for suggestion in top_suggestions])}
+
+Chi tiết một số segment tiêu biểu:
+{chr(10).join([
+    f"Segment {seg['segment_id']}: relevance={seg['relevance_score']:.2f}, semantic={seg['semantic_score']:.2f}, alignment={seg['alignment_score']:.2f}, issues={seg['issues']}"
+    for seg in segments_summary[:8]
+])}
+
+Hãy trả về JSON với các trường sau (KHÔNG có markdown, KHÔNG có giải thích):
+{{
+  "rating": <điểm đánh giá từ 1-5, dựa trên overallScore>,
+  "comments": "<đoạn feedback tổng quan bằng tiếng Việt, viết theo phong cách constructive feedback, khoảng 300-500 từ, bao gồm: điểm mạnh, điểm cần cải thiện, và gợi ý cụ thể>
+}}
+
+Lưu ý:
+- rating phải là số nguyên từ 1-5
+- comments phải là text tiếng Việt, có cấu trúc rõ ràng
+- Viết feedback mang tính xây dựng, khích lệ học viên
+- Nếu overallScore > 0.7 thì rating nên là 4-5
+- Nếu overallScore < 0.4 thì rating nên là 1-2
+
+Return ONLY the JSON object. No markdown, no explanation."""
+
+        try:
+            # Call Gemini API
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
+            result_text = response.text.strip()
+
+            # Clean up response
+            if result_text.startswith('```'):
+                result_text = result_text.split('```')[1]
+                if result_text.startswith('json'):
+                    result_text = result_text[4:]
+            result_text = result_text.strip().strip('`')
+
+            # Parse JSON
+            result = json.loads(result_text)
+
+            rating = int(result.get('rating', 3))
+            comments = str(result.get('comments', ''))
+
+            # Clamp rating to 1-5
+            rating = max(1, min(5, rating))
+
+            logger.info(f"✅ Generated feedback: rating={rating}, comments_length={len(comments)}")
+
+            return {
+                'rating': rating,
+                'overall_score': overall_scores.get('overallScore', 0),
+                'comments': comments,
+                'feedback_type': 'ai_report'
+            }
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse Gemini feedback response: {e}")
+            return self._generate_feedback_fallback(overall_scores, top_issues, top_suggestions)
+        except Exception as e:
+            logger.warning(f"Gemini API error generating feedback: {e}")
+            return self._generate_feedback_fallback(overall_scores, top_issues, top_suggestions)
+
+    def _generate_feedback_fallback(
+        self,
+        overall_scores: Dict,
+        top_issues: list,
+        top_suggestions: list
+    ) -> Dict[str, Any]:
+        """
+        Generate basic feedback without AI if Gemini fails
+        """
+        overall_score = overall_scores.get('overallScore', 0)
+        content_relevance = overall_scores.get('contentRelevance', 0)
+        semantic_similarity = overall_scores.get('semanticSimilarity', 0)
+        slide_alignment = overall_scores.get('slideAlignment', 0)
+
+        # Calculate rating
+        rating = round(overall_score * 5)
+        rating = max(1, min(5, rating))
+
+        # Build comments
+        strengths = []
+        weaknesses = []
+        suggestions = []
+
+        if content_relevance >= 0.7:
+            strengths.append("Nội dung bài thuyết trình liên quan tốt đến chủ đề")
+        elif content_relevance < 0.5:
+            weaknesses.append("Nội dung cần tập trung hơn vào chủ đề chính")
+
+        if semantic_similarity >= 0.7:
+            strengths.append("Trình bày rõ ràng, mạch lạc")
+        elif semantic_similarity < 0.5:
+            weaknesses.append("Cần cải thiện cách diễn đạt để rõ ràng hơn")
+
+        if slide_alignment >= 0.7:
+            strengths.append("Căn chỉnh tốt giữa nói và slide")
+        elif slide_alignment < 0.5:
+            weaknesses.append("Cần cải thiện sự đồng bộ giữa nội dung nói và slide")
+
+        # Add top suggestions
+        for suggestion, _ in top_suggestions[:3]:
+            suggestions.append(suggestion)
+
+        # Build comments text
+        comments_parts = []
+
+        if strengths:
+            comments_parts.append("**Điểm mạnh:**\n- " + "\n- ".join(strengths))
+
+        if weaknesses:
+            comments_parts.append("**Điểm cần cải thiện:**\n- " + "\n- ".join(weaknesses))
+
+        if suggestions:
+            comments_parts.append("**Gợi ý cải thiện:**\n- " + "\n- ".join(suggestions[:3]))
+
+        comments_parts.append(f"\n\n**Điểm số tổng:** {overall_score:.2f}/1.0 ({rating}/5)")
+
+        comments = "\n\n".join(comments_parts)
+
+        return {
+            'rating': rating,
+            'overall_score': overall_score,
+            'comments': comments,
+            'feedback_type': 'ai_report'
+        }
 
 
 # Singleton instance
