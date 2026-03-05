@@ -362,6 +362,181 @@ class DatabaseService:
         except MySQLError as e:
             raise DatabaseError(f"Database query error: {e}")
     
+    def save_feedback(
+        self,
+        presentation_id: int,
+        rating: float,
+        comments: str,
+        feedback_type: str = "general",
+        reviewer_id: Optional[int] = None,
+        is_visible_to_student: bool = True
+    ) -> int:
+        """
+        Save feedback to Feedback table
+
+        Args:
+            presentation_id: Presentation ID
+            rating: Rating (0-1 for AI, 1-5 for human)
+            comments: Feedback comments text
+            feedback_type: Type of feedback (general, content, delivery, structure, engagement)
+            reviewer_id: ID of reviewer (null for AI)
+            is_visible_to_student: Whether student can see this feedback
+
+        Returns:
+            feedbackId of inserted record
+        """
+        self._ensure_connection()
+
+        # Map ai_report to general (since feedbackType is ENUM)
+        if feedback_type == "ai_report":
+            feedback_type = "general"
+
+        # If no reviewer_id (AI), use 24 as placeholder since reviewerId is NOT NULL
+        # (userId 24 is used as system/AI placeholder)
+        if reviewer_id is None:
+            reviewer_id = 24  # System/AI placeholder user
+
+        try:
+            cursor = self.connection.cursor()
+
+            # Check if feedback already exists for this presentation and type
+            cursor.execute("""
+                SELECT feedbackId FROM Feedback
+                WHERE presentationId = %s AND feedbackType = %s
+            """, (presentation_id, feedback_type))
+
+            existing = cursor.fetchone()
+
+            if existing:
+                # Update existing feedback
+                cursor.execute("""
+                    UPDATE Feedback SET
+                        reviewerId = %s,
+                        rating = %s,
+                        comments = %s,
+                        isVisibleToStudent = %s,
+                        createdAtFeedback = NOW()
+                    WHERE presentationId = %s AND feedbackType = %s
+                """, (
+                    reviewer_id,
+                    rating,
+                    comments,
+                    1 if is_visible_to_student else 0,
+                    presentation_id,
+                    feedback_type
+                ))
+                feedback_id = existing[0]
+                logger.info(f"Updated Feedback for presentationId={presentation_id}, feedbackId={feedback_id}")
+            else:
+                # Insert new feedback
+                cursor.execute("""
+                    INSERT INTO Feedback (
+                        presentationId,
+                        reviewerId,
+                        rating,
+                        comments,
+                        feedbackType,
+                        isVisibleToStudent,
+                        createdAtFeedback
+                    ) VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """, (
+                    presentation_id,
+                    reviewer_id,
+                    rating,
+                    comments,
+                    feedback_type,
+                    1 if is_visible_to_student else 0
+                ))
+
+                feedback_id = cursor.lastrowid
+                logger.info(f"Created Feedback for presentationId={presentation_id}, feedbackId={feedback_id}")
+
+            cursor.close()
+            return feedback_id
+
+        except MySQLError as e:
+            raise DatabaseError(f"Failed to save feedback: {e}")
+
+    def get_segment_analyses_for_feedback(self, presentation_id: int) -> Dict[str, Any]:
+        """
+        Get segment analyses and overall scores for generating feedback
+
+        Args:
+            presentation_id: Presentation ID
+
+        Returns:
+            Dict with segment_analyses and overall_scores
+        """
+        self._ensure_connection()
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+
+            # Get segment analyses
+            cursor.execute("""
+                SELECT
+                    sa.segmentId,
+                    sa.relevanceScore,
+                    sa.semanticScore,
+                    sa.alignmentScore,
+                    sa.bestMatchingSlide,
+                    sa.expectedSlideNumber,
+                    sa.timingDeviation,
+                    sa.issues,
+                    sa.suggestions,
+                    sa.topicKeywordsFound,
+                    ts.segmentText,
+                    ts.startTimestamp,
+                    ts.endTimestamp
+                FROM SegmentAnalyses sa
+                JOIN TranscriptSegments ts ON sa.segmentId = ts.segmentId
+                JOIN Transcripts t ON ts.transcriptId = t.transcriptId
+                WHERE t.presentationId = %s
+                ORDER BY ts.segmentNumber ASC
+            """, (presentation_id,))
+
+            segment_analyses = cursor.fetchall()
+
+            # Calculate overall scores from segment analyses
+            if segment_analyses:
+                total = len(segment_analyses)
+                avg_relevance = sum(float(sa.get('relevanceScore', 0) or 0) for sa in segment_analyses) / total
+                avg_semantic = sum(float(sa.get('semanticScore', 0) or 0) for sa in segment_analyses) / total
+                avg_alignment = sum(float(sa.get('alignmentScore', 0) or 0) for sa in segment_analyses) / total
+
+                overall_scores = {
+                    'overallScore': (avg_relevance * 0.3 + avg_semantic * 0.3 + avg_alignment * 0.4),
+                    'contentRelevance': avg_relevance,
+                    'semanticSimilarity': avg_semantic,
+                    'slideAlignment': avg_alignment
+                }
+            else:
+                overall_scores = None
+
+            # Get presentation info
+            cursor.execute("""
+                SELECT
+                    p.title,
+                    t.topicName,
+                    t.description as topicDescription
+                FROM Presentations p
+                JOIN Topics t ON p.topicId = t.topicId
+                WHERE p.presentationId = %s
+            """, (presentation_id,))
+
+            presentation_info = cursor.fetchone()
+
+            cursor.close()
+
+            return {
+                "segment_analyses": segment_analyses or [],
+                "overall_scores": overall_scores,
+                "presentation_info": presentation_info
+            }
+
+        except MySQLError as e:
+            raise DatabaseError(f"Failed to get segment analyses for feedback: {e}")
+
     def close(self):
         """Close database connection"""
         if self.connection and self.connection.is_connected():

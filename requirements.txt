@@ -18,3 +18,7 @@ coloredlogs>=15.0.0
 
 # AI - Gemini
 google-genai>=1.0.0
+
+# API Server
+fastapi>=0.100.0
+uvicorn>=0.23.0
