@@ -29,19 +29,23 @@ class Settings:
     # Database Configuration (MySQL)
     DB_HOST = os.getenv('DB_HOST', 'localhost')
     DB_PORT = int(os.getenv('DB_PORT', '3306'))
-    DB_NAME = os.getenv('DB_NAME', 'OratorAI')
-    DB_USER = os.getenv('DB_USER')
+    DB_NAME = os.getenv('DB_DATABASE_NAME', 'OratorAI')
+    DB_USER = os.getenv('DB_USERNAME')
     DB_PASSWORD = os.getenv('DB_PASSWORD')
     DB_SSL = os.getenv('DB_SSL', 'true').lower() == 'true'
     
     # Webhook Configuration
-    WEBHOOK_BASE_URL = os.getenv('WEBHOOK_BASE_URL', 'http://localhost:3000')
+    WEBHOOK_BASE_URL = os.getenv('WEBHOOK_URL', 'http://localhost:8080')
     WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
     
     # Analysis Configuration
     SIMILARITY_THRESHOLD = float(os.getenv('SIMILARITY_THRESHOLD', '0.5'))
     RELEVANCE_THRESHOLD = float(os.getenv('RELEVANCE_THRESHOLD', '0.5'))
     ALIGNMENT_THRESHOLD = float(os.getenv('ALIGNMENT_THRESHOLD', '0.5'))
+    
+    # AI Configuration (Gemini)
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
     
     # Logging Configuration
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
