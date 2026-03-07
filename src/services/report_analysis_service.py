@@ -2,21 +2,34 @@
 Report Analysis Service - Core logic for analyzing presentation segments
 
 This service analyzes each transcript segment against slides and topic,
-calculating scores and generating issues/suggestions using Gemini AI.
+calculating scores and generating issues/suggestions using AI (OpenAI or Gemini).
 """
 
 import json
 import re
-import google.genai as genai
 from typing import List, Dict, Any, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime
+
+# Import AI clients
+try:
+    import google.genai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
 from src.config.settings import settings
 from src.services.database_service import (
     DatabaseService, 
     PresentationData, 
     SegmentAnalysisResult, 
-    OverallScores
+    OverallScores,
+    get_database_service
 )
 from src.utils.logger import get_logger
 from src.utils.exceptions import AnalysisError
@@ -33,45 +46,76 @@ class ReportAnalysisService:
         self.relevance_threshold = settings.RELEVANCE_THRESHOLD
         self.alignment_threshold = settings.ALIGNMENT_THRESHOLD
         
-        # Initialize Gemini AI
-        if not settings.GEMINI_API_KEY:
-            raise AnalysisError("GEMINI_API_KEY is not configured")
+        # Initialize AI client based on provider setting
+        self.ai_provider = settings.AI_PROVIDER.lower()
         
-        # Use new google.genai client
-        self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
-        self.model_name = settings.GEMINI_MODEL
-        logger.info(f"✅ Gemini AI initialized with model: {settings.GEMINI_MODEL}")
+        if self.ai_provider == 'openai':
+            if not settings.OPENAI_API_KEY:
+                raise AnalysisError("OPENAI_API_KEY is not configured")
+            
+            if not OPENAI_AVAILABLE:
+                raise AnalysisError("openai package not installed")
+            
+            self.openai_client = OpenAI(
+                api_key=settings.OPENAI_API_KEY,
+                base_url=settings.OPENAI_BASE_URL
+            )
+            self.model_name = settings.OPENAI_MODEL
+            logger.info(f"✅ OpenAI AI initialized with model: {settings.OPENAI_MODEL}, base_url: {settings.OPENAI_BASE_URL}")
+            
+        elif self.ai_provider == 'gemini':
+            if not settings.GEMINI_API_KEY:
+                raise AnalysisError("GEMINI_API_KEY is not configured")
+            
+            if not GEMINI_AVAILABLE:
+                raise AnalysisError("google-genai package not installed")
+            
+            self.gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+            self.model_name = settings.GEMINI_MODEL
+            logger.info(f"✅ Gemini AI initialized with model: {settings.GEMINI_MODEL}")
+        else:
+            raise AnalysisError(f"Invalid AI_PROVIDER: {self.ai_provider}. Use 'openai' or 'gemini'")
+    
+    def _call_ai(self, prompt: str) -> str:
+        """Call AI API based on configured provider"""
+        try:
+            if self.ai_provider == 'openai':
+                response = self.openai_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=4000
+                )
+                return response.choices[0].message.content
+                
+            elif self.ai_provider == 'gemini':
+                response = self.gemini_client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt
+                )
+                return response.text
+                
+        except Exception as e:
+            logger.error(f"AI API call failed: {e}")
+            raise
         
     def analyze_presentation(
         self, 
         presentation_data: PresentationData
     ) -> Tuple[List[SegmentAnalysisResult], OverallScores]:
-        """
-        Analyze all segments of a presentation
-        
-        Args:
-            presentation_data: Presentation data with segments and slides
-            
-        Returns:
-            Tuple of (list of segment analyses, overall scores)
-        """
+        """Analyze all segments of a presentation"""
         logger.info(f"🔍 Starting analysis for presentation {presentation_data.presentation_id}")
         logger.info(f"   - Segments: {len(presentation_data.transcript_segments)}")
         logger.info(f"   - Slides: {len(presentation_data.slides)}")
         
-        # Extract topic keywords
         topic_keywords = self._extract_topic_keywords(
             presentation_data.topic_name,
             presentation_data.topic_description
         )
         
-        # Build slide content map
         slide_contents = self._build_slide_content_map(presentation_data.slides)
-        
-        # Calculate total duration for timing analysis
         total_duration = self._calculate_total_duration(presentation_data.transcript_segments)
         
-        # Analyze each segment
         segment_analyses = []
         
         for segment in presentation_data.transcript_segments:
@@ -88,7 +132,6 @@ class ReportAnalysisService:
                 
             except Exception as e:
                 logger.error(f"Error analyzing segment {segment.get('segmentId')}: {e}")
-                # Create a default analysis for failed segments
                 segment_analyses.append(SegmentAnalysisResult(
                     segment_id=segment.get('segmentId', 0),
                     relevance_score=0.0,
@@ -102,7 +145,6 @@ class ReportAnalysisService:
                     topic_keywords_found=[]
                 ))
         
-        # Calculate overall scores
         overall_scores = self._calculate_overall_scores(segment_analyses)
         
         logger.info(f"✅ Analysis complete:")
@@ -114,25 +156,11 @@ class ReportAnalysisService:
         return segment_analyses, overall_scores
     
     def _extract_topic_keywords(self, topic_name: str, topic_description: str) -> List[str]:
-        """
-        Extract keywords from topic name and description
-        
-        Args:
-            topic_name: Topic name
-            topic_description: Topic description
-            
-        Returns:
-            List of keywords
-        """
+        """Extract keywords from topic name and description"""
         keywords = []
-        
-        # Combine text
         text = f"{topic_name} {topic_description or ''}"
-        
-        # Extract words (Vietnamese and English support)
         words = re.findall(r'\b[\w]{3,}\b', text.lower())
         
-        # Filter common words and short words
         stop_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 
                      'can', 'had', 'her', 'was', 'one', 'our', 'out', 'has',
                      'và', 'của', 'trong', 'được', 'với', 'cho', 'từ', 'là',
@@ -140,7 +168,6 @@ class ReportAnalysisService:
         
         keywords = [w for w in words if w not in stop_words and len(w) > 2]
         
-        # Remove duplicates while preserving order
         seen = set()
         unique_keywords = []
         for kw in keywords:
@@ -148,7 +175,7 @@ class ReportAnalysisService:
                 seen.add(kw)
                 unique_keywords.append(kw)
         
-        return unique_keywords[:20]  # Limit to top 20 keywords
+        return unique_keywords[:20]
     
     def _build_slide_content_map(self, slides: List[Dict]) -> Dict[int, str]:
         """Build a map of slide number to content"""
@@ -163,13 +190,11 @@ class ReportAnalysisService:
         """Calculate total duration from segments"""
         if not segments:
             return 0.0
-        
         max_end = 0
         for seg in segments:
             end_time = seg.get('endTimestamp', 0)
             if end_time and end_time > max_end:
                 max_end = end_time
-        
         return float(max_end)
     
     def _analyze_segment(
@@ -181,30 +206,15 @@ class ReportAnalysisService:
         total_duration: float,
         total_segments: int
     ) -> SegmentAnalysisResult:
-        """
-        Analyze a single transcript segment using Gemini AI
-        
-        Args:
-            segment: Transcript segment data
-            topic_keywords: Topic keywords
-            slide_contents: Map of slide number to content
-            slides: List of slides
-            total_duration: Total presentation duration
-            total_segments: Total number of segments
-            
-        Returns:
-            SegmentAnalysisResult
-        """
+        """Analyze a single transcript segment using AI"""
         segment_id = segment.get('segmentId', 0)
         segment_text = segment.get('segmentText', '') or segment.get('content', '')
         start_time = float(segment.get('startTimestamp', 0) or 0)
         end_time = float(segment.get('endTimestamp', 0) or 0)
         
-        # Find current slide (from segment data or calculate)
         current_slide_id = segment.get('slideId', 1)
         current_slide_content = slide_contents.get(current_slide_id, '')
         
-        # Prepare prompt for Gemini
         prompt = f"""You are an expert presentation analyst. Analyze this transcript segment and return ONLY valid JSON (no markdown, no explanation).
 
 Presentation Context:
@@ -239,24 +249,16 @@ Analyze and return JSON with these exact fields:
 Return ONLY the JSON object. No markdown, no code blocks."""
 
         try:
-            # Call Gemini API using new google.genai client
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt
-            )
-            result_text = response.text.strip()
+            result_text = self._call_ai(prompt)
             
-            # Clean up response (remove markdown if present)
             if result_text.startswith('```'):
                 result_text = result_text.split('```')[1]
                 if result_text.startswith('json'):
                     result_text = result_text[4:]
             result_text = result_text.strip().strip('`')
             
-            # Parse JSON
             result = json.loads(result_text)
             
-            # Map to SegmentAnalysisResult
             return SegmentAnalysisResult(
                 segment_id=segment_id,
                 relevance_score=result.get('relevance_score', 50) / 100.0,
@@ -271,10 +273,10 @@ Return ONLY the JSON object. No markdown, no code blocks."""
             )
             
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse Gemini response: {e}, using fallback")
+            logger.warning(f"Failed to parse AI response: {e}, using fallback")
             return self._analyze_segment_fallback(segment, topic_keywords, slide_contents, slides, total_duration, total_segments, current_slide_id)
         except Exception as e:
-            logger.warning(f"Gemini API error: {e}, using fallback")
+            logger.warning(f"AI API error: {e}, using fallback")
             return self._analyze_segment_fallback(segment, topic_keywords, slide_contents, slides, total_duration, total_segments, current_slide_id)
     
     def _analyze_segment_fallback(
@@ -292,14 +294,11 @@ Return ONLY the JSON object. No markdown, no code blocks."""
         segment_text = (segment.get('segmentText', '') or '').lower()
         start_time = float(segment.get('startTimestamp', 0) or 0)
         
-        # Find topic keywords in segment
         keywords_found = [kw for kw in topic_keywords if kw.lower() in segment_text]
         
-        # Calculate relevance score
         relevance_score = len(keywords_found) / max(len(topic_keywords), 1) if topic_keywords else 0.5
         relevance_score = min(relevance_score * 2, 1.0)
         
-        # Find best matching slide
         best_matching_slide = current_slide_id
         best_similarity = 0.0
         
@@ -313,7 +312,6 @@ Return ONLY the JSON object. No markdown, no code blocks."""
         
         semantic_score = best_similarity
         
-        # Expected slide number
         expected_slide_number = 1
         if total_duration > 0 and slides:
             progress = start_time / total_duration
@@ -323,7 +321,6 @@ Return ONLY the JSON object. No markdown, no code blocks."""
         timing_deviation = abs(best_matching_slide - expected_slide_number)
         alignment_score = 1.0 - min(timing_deviation / max(len(slides), 1), 1.0)
         
-        # Issues and suggestions
         issues = []
         suggestions = []
         
@@ -360,15 +357,7 @@ Return ONLY the JSON object. No markdown, no code blocks."""
         self,
         segment_analyses: List[SegmentAnalysisResult]
     ) -> OverallScores:
-        """
-        Calculate overall scores from all segment analyses
-
-        Args:
-            segment_analyses: List of segment analysis results
-
-        Returns:
-            OverallScores object
-        """
+        """Calculate overall scores from all segment analyses"""
         if not segment_analyses:
             return OverallScores(
                 content_relevance=0.0,
@@ -377,14 +366,11 @@ Return ONLY the JSON object. No markdown, no code blocks."""
                 overall_score=0.0
             )
 
-        # Calculate averages
         n = len(segment_analyses)
-
         avg_relevance = sum(a.relevance_score for a in segment_analyses) / n
         avg_semantic = sum(a.semantic_score for a in segment_analyses) / n
         avg_alignment = sum(a.alignment_score for a in segment_analyses) / n
 
-        # Weighted overall score
         overall_score = (
             avg_relevance * 0.3 +
             avg_semantic * 0.3 +
@@ -404,25 +390,14 @@ Return ONLY the JSON object. No markdown, no code blocks."""
         topic_name: str,
         topic_description: str,
         segment_analyses: List[Dict],
-        overall_scores: Dict
+        overall_scores: Dict,
+        course_name: str = None,
+        course_description: str = None,
+        topic_requirements: str = None
     ) -> Dict[str, Any]:
-        """
-        Generate comprehensive feedback using Gemini AI
+        """Generate comprehensive feedback using AI"""
+        logger.info(f"🤖 Generating feedback with {self.ai_provider.upper()} AI...")
 
-        Args:
-            presentation_title: Title of presentation
-            topic_name: Topic name
-            topic_description: Topic description
-            segment_analyses: List of segment analysis results from DB
-            overall_scores: Overall scores from AnalysisResults
-
-        Returns:
-            Dict with rating (1-5) and comments
-        """
-        logger.info("🤖 Generating feedback with Gemini AI...")
-
-        # Prepare summary data for prompt
-        # Take up to 10 segments (5 best, 5 worst) to keep prompt manageable
         if len(segment_analyses) > 10:
             sorted_by_score = sorted(
                 segment_analyses,
@@ -434,50 +409,17 @@ Return ONLY the JSON object. No markdown, no code blocks."""
         else:
             selected_segments = segment_analyses
 
-        # Build segment summaries
-        segments_summary = []
-        for seg in selected_segments:
-            issues = seg.get('issues', [])
-            suggestions = seg.get('suggestions', [])
-            if isinstance(issues, str):
-                import json
-                try:
-                    issues = json.loads(issues)
-                except:
-                    issues = []
-            if isinstance(suggestions, str):
-                import json
-                try:
-                    suggestions = json.loads(suggestions)
-                except:
-                    suggestions = []
-
-            segments_summary.append({
-                'segment_id': seg.get('segmentId'),
-                'relevance_score': seg.get('relevanceScore', 0),
-                'semantic_score': seg.get('semanticScore', 0),
-                'alignment_score': seg.get('alignmentScore', 0),
-                'best_matching_slide': seg.get('bestMatchingSlide'),
-                'timing_deviation': seg.get('timingDeviation', 0),
-                'issues': issues[:3],  # Top 3 issues per segment
-                'suggestions': suggestions[:3],  # Top 3 suggestions
-                'segment_text': (seg.get('segmentText', '') or '')[:200]  # Truncate long text
-            })
-
-        # Count common issues and suggestions across all segments
         all_issues = []
         all_suggestions = []
         for seg in segment_analyses:
             issues = seg.get('issues', [])
             suggestions = seg.get('suggestions', [])
             if isinstance(issues, str):
-                import json
                 try:
                     issues = json.loads(issues)
                 except:
                     issues = []
             if isinstance(suggestions, str):
-                import json
                 try:
                     suggestions = json.loads(suggestions)
                 except:
@@ -485,10 +427,20 @@ Return ONLY the JSON object. No markdown, no code blocks."""
             all_issues.extend(issues)
             all_suggestions.extend(suggestions)
 
-        # Get top issues and suggestions
         from collections import Counter
         top_issues = Counter(all_issues).most_common(5)
         top_suggestions = Counter(all_suggestions).most_common(5)
+
+        slide_audio_compatibility = overall_scores.get('slideAlignment', 0) * 100
+        topic_task_relevance = overall_scores.get('contentRelevance', 0) * 100
+
+        course_info = ""
+        if course_name:
+            course_info += f"\n- Tên môn học: {course_name}"
+        if course_description:
+            course_info += f"\n- Mô tả môn học: {course_description}"
+        if topic_requirements:
+            course_info += f"\n- Yêu cầu/Clearning outcomes của topic: {topic_requirements}"
 
         prompt = f"""Bạn là một chuyên gia đánh giá bài thuyết trình. Hãy viết feedback tổng quan cho bài thuyết trình dựa trên dữ liệu phân tích dưới đây.
 
@@ -496,6 +448,7 @@ Thông tin bài thuyết trình:
 - Tiêu đề: {presentation_title}
 - Chủ đề: {topic_name}
 - Mô tả chủ đề: {topic_description}
+{course_info}
 
 Điểm tổng quan:
 - Overall Score: {overall_scores.get('overallScore', 0):.2f}/1.0
@@ -509,49 +462,36 @@ Các vấn đề phổ biến nhất:
 Các đề xuất cải thiện phổ biến nhất:
 {chr(10).join([f"- {suggestion[0]}" for suggestion in top_suggestions])}
 
-Chi tiết một số segment tiêu biểu:
-{chr(10).join([
-    f"Segment {seg['segment_id']}: relevance={seg['relevance_score']:.2f}, semantic={seg['semantic_score']:.2f}, alignment={seg['alignment_score']:.2f}, issues={seg['issues']}"
-    for seg in segments_summary[:8]
-])}
-
 Hãy trả về JSON với các trường sau (KHÔNG có markdown, KHÔNG có giải thích):
 {{
-  "rating": <điểm đánh giá từ 1-5, dựa trên overallScore>,
-  "comments": "<đoạn feedback tổng quan bằng tiếng Việt, viết theo phong cách constructive feedback, khoảng 300-500 từ, bao gồm: điểm mạnh, điểm cần cải thiện, và gợi ý cụ thể>
+  "rating": <điểm đánh giá từ 1-5>,
+  "comments": "<đoạn feedback tổng quan bằng tiếng Việt, khoảng 500-700 từ, xuống dòng rõ ràng>"
 }}
 
 Lưu ý:
 - rating phải là số nguyên từ 1-5
-- comments phải là text tiếng Việt, có cấu trúc rõ ràng
-- Viết feedback mang tính xây dựng, khích lệ học viên
-- Nếu overallScore > 0.7 thì rating nên là 4-5
-- Nếu overallScore < 0.4 thì rating nên là 1-2
+- comments phải là text tiếng Việt
 
 Return ONLY the JSON object. No markdown, no explanation."""
 
         try:
-            # Call Gemini API
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt
-            )
-            result_text = response.text.strip()
+            result_text = self._call_ai(prompt)
 
-            # Clean up response
             if result_text.startswith('```'):
                 result_text = result_text.split('```')[1]
                 if result_text.startswith('json'):
                     result_text = result_text[4:]
             result_text = result_text.strip().strip('`')
 
-            # Parse JSON
+            result_text = ''.join(char for char in result_text if ord(char) >= 32 or char in '\n\t\r')
+            
+            if '```json' in result_text:
+                result_text = result_text.split('```json')[1].split('```')[0]
+
             result = json.loads(result_text)
 
             rating = int(result.get('rating', 3))
             comments = str(result.get('comments', ''))
-
-            # Clamp rating to 1-5
             rating = max(1, min(5, rating))
 
             logger.info(f"✅ Generated feedback: rating={rating}, comments_length={len(comments)}")
@@ -564,10 +504,10 @@ Return ONLY the JSON object. No markdown, no explanation."""
             }
 
         except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse Gemini feedback response: {e}")
+            logger.warning(f"Failed to parse AI feedback response: {e}")
             return self._generate_feedback_fallback(overall_scores, top_issues, top_suggestions)
         except Exception as e:
-            logger.warning(f"Gemini API error generating feedback: {e}")
+            logger.warning(f"AI API error generating feedback: {e}")
             return self._generate_feedback_fallback(overall_scores, top_issues, top_suggestions)
 
     def _generate_feedback_fallback(
@@ -576,43 +516,52 @@ Return ONLY the JSON object. No markdown, no explanation."""
         top_issues: list,
         top_suggestions: list
     ) -> Dict[str, Any]:
-        """
-        Generate basic feedback without AI if Gemini fails
-        """
+        """Generate basic feedback without AI if AI fails"""
         overall_score = overall_scores.get('overallScore', 0)
         content_relevance = overall_scores.get('contentRelevance', 0)
         semantic_similarity = overall_scores.get('semanticSimilarity', 0)
         slide_alignment = overall_scores.get('slideAlignment', 0)
 
-        # Calculate rating
         rating = round(overall_score * 5)
         rating = max(1, min(5, rating))
 
-        # Build comments
+        slide_audio_compatibility = slide_alignment * 100
+        topic_task_relevance = content_relevance * 100
+
         strengths = []
         weaknesses = []
         suggestions = []
 
         if content_relevance >= 0.7:
-            strengths.append("Nội dung bài thuyết trình liên quan tốt đến chủ đề")
+            strengths.append("1) Nội dung và độ chính xác: Nội dung liên quan tốt đến chủ đề")
         elif content_relevance < 0.5:
-            weaknesses.append("Nội dung cần tập trung hơn vào chủ đề chính")
+            weaknesses.append("1) Nội dung và độ chính xác: Cần tập trung hơn vào chủ đề chính")
 
         if semantic_similarity >= 0.7:
-            strengths.append("Trình bày rõ ràng, mạch lạc")
+            strengths.append("2) Cấu trúc và logic: Trình bày rõ ràng, mạch lạc")
         elif semantic_similarity < 0.5:
-            weaknesses.append("Cần cải thiện cách diễn đạt để rõ ràng hơn")
+            weaknesses.append("2) Cấu trúc và logic: Cần cải thiện cách sắp xếp nội dung")
+
+        if overall_score >= 0.7:
+            strengths.append("3) Kỹ năng thuyết trình: Trình bày tốt")
+        elif overall_score < 0.5:
+            weaknesses.append("3) Kỹ năng thuyết trình: Cần cải thiện")
+
+        strengths.append("4) Làm việc nhóm: (Cần đánh giá thêm từ video)")
 
         if slide_alignment >= 0.7:
-            strengths.append("Căn chỉnh tốt giữa nói và slide")
+            strengths.append(f"5) Tương thích Slide – Audio: Tốt ({slide_audio_compatibility:.1f}%)")
         elif slide_alignment < 0.5:
-            weaknesses.append("Cần cải thiện sự đồng bộ giữa nội dung nói và slide")
+            weaknesses.append(f"5) Tương thích Slide – Audio: Cần cải thiện ({slide_audio_compatibility:.1f}%)")
 
-        # Add top suggestions
+        if content_relevance >= 0.7:
+            strengths.append(f"6) Phù hợp với yêu cầu đề tài: Tốt ({topic_task_relevance:.1f}%)")
+        elif content_relevance < 0.5:
+            weaknesses.append(f"6) Phù hợp với yêu cầu đề tài: Cần cải thiện ({topic_task_relevance:.1f}%)")
+
         for suggestion, _ in top_suggestions[:3]:
             suggestions.append(suggestion)
 
-        # Build comments text
         comments_parts = []
 
         if strengths:
@@ -635,11 +584,403 @@ Return ONLY the JSON object. No markdown, no explanation."""
             'feedback_type': 'ai_report'
         }
 
+    # ============================================================
+    # TEAMWORK ANALYSIS METHODS
+    # ============================================================
+
+    def analyze_teamwork(self, transcript_data: Dict[str, Any]) -> 'TeamworkAnalysisResult':
+        """Analyze teamwork aspects of a group presentation"""
+        logger.info(f"🔍 Analyzing teamwork for presentation...")
+
+        segments = transcript_data.get('segments', [])
+        speakers = transcript_data.get('speakers', [])
+
+        if not segments or len(speakers) < 2:
+            return TeamworkAnalysisResult(
+                participation_balance={"status": "insufficient_data"},
+                speaker_transitions={"status": "insufficient_data"},
+                topic_continuity={"status": "insufficient_data"},
+                overall_teamwork_score=0.0,
+                feedback="Dữ liệu không đủ để phân tích làm việc nhóm. Cần có ít nhất 2 người nói và nhiều đoạn transcript."
+            )
+
+        participation = self._analyze_participation_balance(segments, speakers)
+        transitions = self._analyze_speaker_transitions(segments)
+        continuity = self._analyze_topic_continuity(segments)
+
+        overall_score = self._calculate_teamwork_score(participation, transitions, continuity)
+        feedback = self._generate_teamwork_feedback(participation, transitions, continuity, overall_score)
+
+        logger.info(f"✅ Teamwork analysis complete: score={overall_score:.2f}")
+
+        return TeamworkAnalysisResult(
+            participation_balance=participation,
+            speaker_transitions=transitions,
+            topic_continuity=continuity,
+            overall_teamwork_score=overall_score,
+            feedback=feedback
+        )
+
+    def _analyze_participation_balance(self, segments: List[Dict], speakers: List[Dict]) -> Dict[str, Any]:
+        """Analyze participation balance among speakers"""
+        speaker_stats = {}
+
+        for seg in segments:
+            speaker_id = seg.get('speakerId')
+            speaker_name = seg.get('speakerName', f'Speaker {speaker_id}')
+
+            if speaker_id is None:
+                continue
+
+            if speaker_id not in speaker_stats:
+                speaker_stats[speaker_id] = {
+                    'name': speaker_name,
+                    'word_count': 0,
+                    'segment_count': 0,
+                    'total_duration': 0.0
+                }
+
+            word_count = seg.get('wordCount', 0) or 0
+            start_time = float(seg.get('startTimestamp', 0) or 0)
+            end_time = float(seg.get('endTimestamp', 0) or 0)
+            duration = end_time - start_time if end_time > start_time else 0
+
+            speaker_stats[speaker_id]['word_count'] += word_count
+            speaker_stats[speaker_id]['segment_count'] += 1
+            speaker_stats[speaker_id]['total_duration'] += duration
+
+        if not speaker_stats:
+            return {"status": "no_speaker_data", "details": {}}
+
+        total_words = sum(s['word_count'] for s in speaker_stats.values())
+        total_duration = sum(s['total_duration'] for s in speaker_stats.values())
+
+        speaker_list = []
+        ideal_percentage = 100 / len(speaker_stats) if speaker_stats else 100
+        for sid, stats in speaker_stats.items():
+            word_pct = (stats['word_count'] / total_words * 100) if total_words > 0 else 0
+            duration_pct = (stats['total_duration'] / total_duration * 100) if total_duration > 0 else 0
+            speaker_list.append({
+                'speaker_id': sid,
+                'name': stats['name'],
+                'word_count': stats['word_count'],
+                'word_percentage': round(word_pct, 1),
+                'segment_count': stats['segment_count'],
+                'duration_seconds': round(stats['total_duration'], 1),
+                'duration_percentage': round(duration_pct, 1)
+            })
+
+        if len(speaker_list) > 1:
+            percentages = [s['word_percentage'] for s in speaker_list]
+            ideal_pct = 100 / len(speaker_list)
+            variance = sum(abs(p - ideal_pct) for p in percentages) / len(percentages)
+            balance_score = max(0, 1 - (variance / 100))
+        else:
+            balance_score = 1.0
+
+        if balance_score >= 0.8:
+            status = "excellent"
+            status_text = "Phân chia rất cân bằng"
+        elif balance_score >= 0.6:
+            status = "good"
+            status_text = "Phân chia khá cân bằng"
+        elif balance_score >= 0.4:
+            status = "fair"
+            status_text = "Phân chia chưa đều"
+        else:
+            status = "poor"
+            status_text = "Mất cân bằng nghiêm trọng"
+
+        outliers = []
+        for s in speaker_list:
+            if s['word_percentage'] < ideal_percentage * 0.5:
+                outliers.append(f"{s['name']} nói quá ít ({s['word_percentage']:.1f}%)")
+            elif s['word_percentage'] > ideal_percentage * 1.5:
+                outliers.append(f"{s['name']} nói quá nhiều ({s['word_percentage']:.1f}%)")
+
+        return {
+            "status": status,
+            "status_text": status_text,
+            "balance_score": round(balance_score, 3),
+            "speakers": speaker_list,
+            "total_words": total_words,
+            "total_duration_seconds": round(total_duration, 1),
+            "ideal_percentage_per_speaker": round(ideal_percentage, 1),
+            "outliers": outliers
+        }
+
+    def _analyze_speaker_transitions(self, segments: List[Dict]) -> Dict[str, Any]:
+        """Analyze how smoothly speakers transition between each other"""
+        if len(segments) < 2:
+            return {"status": "insufficient_data", "transitions": [], "transition_score": 0.0}
+
+        transitions = []
+        prev_speaker_id = None
+
+        for seg in segments:
+            speaker_id = seg.get('speakerId')
+            if speaker_id is not None and speaker_id != prev_speaker_id:
+                if prev_speaker_id is not None:
+                    prev_name = f"Speaker {prev_speaker_id}"
+                    curr_name = f"Speaker {speaker_id}"
+                    for s in segments:
+                        if s.get('speakerId') == prev_speaker_id:
+                            prev_name = s.get('speakerName', prev_name)
+                        if s.get('speakerId') == speaker_id:
+                            curr_name = s.get('speakerName', curr_name)
+
+                    transitions.append({
+                        "from": prev_speaker_id,
+                        "from_name": prev_name,
+                        "to": speaker_id,
+                        "to_name": curr_name
+                    })
+                prev_speaker_id = speaker_id
+
+        unique_transitions = len(set((t['from'], t['to']) for t in transitions))
+        total_transitions = len(transitions)
+
+        transition_score = 0.0
+        if total_transitions > 0:
+            same_speaker_count = sum(1 for i in range(len(segments)-1)
+                                   if segments[i].get('speakerId') == segments[i+1].get('speakerId')
+                                   and segments[i].get('speakerId') is not None)
+
+            smoothness = unique_transitions / max(total_transitions, 1)
+            transition_score = smoothness * (1 - same_speaker_count / max(len(segments), 1))
+
+        if transition_score >= 0.7:
+            status = "excellent"
+            status_text = "Chuyển lượt rất mượt mà"
+        elif transition_score >= 0.5:
+            status = "good"
+            status_text = "Chuyển lượt khá tốt"
+        elif transition_score >= 0.3:
+            status = "fair"
+            status_text = "Chuyển lượt cần cải thiện"
+        else:
+            status = "poor"
+            status_text = "Chuyển lượt chưa mượt"
+
+        has_turn_taking = len(set(t['from'] for t in transitions)) >= 2
+        pattern = "Có sự luân phiên giữa các thành viên" if has_turn_taking else "Một người nói chiếm phần lớn"
+
+        return {
+            "status": status,
+            "status_text": status_text,
+            "transition_score": round(transition_score, 3),
+            "total_transitions": total_transitions,
+            "unique_transitions": unique_transitions,
+            "transitions": transitions[:10],
+            "has_turn_taking": has_turn_taking,
+            "pattern": pattern
+        }
+
+    def _analyze_topic_continuity(self, segments: List[Dict]) -> Dict[str, Any]:
+        """Analyze topic continuity between speakers"""
+        if len(segments) < 2:
+            return {"status": "insufficient_data", "continuity_score": 0.0}
+
+        segment_topics = []
+        for seg in segments:
+            text = seg.get('segmentText', '') or ''
+            speaker_id = seg.get('speakerId')
+            speaker_name = seg.get('speakerName', f'Speaker {speaker_id}')
+
+            words = text.lower().split()
+            stop_words = {'the', 'and', 'is', 'to', 'a', 'of', 'in', 'for', 'it', 'on', 'that', 'this',
+                         'và', 'là', 'của', 'trong', 'được', 'với', 'cho', 'từ', 'này', 'đó', 'các',
+                         'um', 'uh', 'ah', 'eh', 'okay', 'so', 'well', 'like', 'just'}
+            keywords = [w for w in words if len(w) > 3 and w not in stop_words][:5]
+
+            segment_topics.append({
+                'segment_id': seg.get('segmentId'),
+                'speaker_id': speaker_id,
+                'speaker_name': speaker_name,
+                'text': text[:100],
+                'keywords': keywords
+            })
+
+        continuity_score = 0.5
+        topic_matches = 0
+        total_transitions = 0
+
+        for i in range(len(segment_topics) - 1):
+            curr = segment_topics[i]
+            next_seg = segment_topics[i + 1]
+
+            if curr['speaker_id'] != next_seg['speaker_id'] and curr['speaker_id'] is not None:
+                total_transitions += 1
+                curr_keywords = set(curr['keywords'])
+                next_keywords = set(next_seg['keywords'])
+                overlap = curr_keywords.intersection(next_keywords)
+                if overlap:
+                    topic_matches += 1
+
+        if total_transitions > 0:
+            continuity_score = topic_matches / total_transitions
+
+        if continuity_score >= 0.6:
+            status = "excellent"
+            status_text = "Nội dung tiếp nối rất tốt"
+        elif continuity_score >= 0.4:
+            status = "good"
+            status_text = "Nội dung tiếp nối khá tốt"
+        elif continuity_score >= 0.2:
+            status = "fair"
+            status_text = "Nội dung còn rời rạc"
+        else:
+            status = "poor"
+            status_text = "Nội dung rời rạc, thiếu tiếp nối"
+
+        speaker_topics = {}
+        for topic in segment_topics:
+            sid = topic['speaker_id']
+            if sid not in speaker_topics:
+                speaker_topics[sid] = {'name': topic['speaker_name'], 'topics': set()}
+            speaker_topics[sid]['topics'].update(topic['keywords'])
+
+        return {
+            "status": status,
+            "status_text": status_text,
+            "continuity_score": round(continuity_score, 3),
+            "topic_matches": topic_matches,
+            "total_speaker_transitions": total_transitions,
+            "speaker_topic_overview": [
+                {'name': v['name'], 'topic_count': len(v['topics'])}
+                for v in speaker_topics.values()
+            ]
+        }
+
+    def _calculate_teamwork_score(self, participation: Dict, transitions: Dict, continuity: Dict) -> float:
+        """Calculate overall teamwork score from individual metrics"""
+        participation_score = participation.get('balance_score', 0.5)
+        transition_score = transitions.get('transition_score', 0.5)
+        continuity_score = continuity.get('continuity_score', 0.5)
+
+        available_scores = [s for s in [participation_score, transition_score, continuity_score] if s > 0]
+        if not available_scores:
+            return 0.0
+
+        overall = (
+            participation_score * 0.4 +
+            transition_score * 0.3 +
+            continuity_score * 0.3
+        )
+
+        return round(overall, 3)
+
+    def _generate_teamwork_feedback(self, participation: Dict, transitions: Dict, continuity: Dict, overall_score: float) -> str:
+        """Generate Vietnamese feedback for teamwork"""
+
+        feedback_parts = []
+        feedback_parts.append("📊 **PHÂN TÍCH LÀM VIỆC NHÓM**\n")
+
+        if overall_score >= 0.7:
+            feedback_parts.append("✅ **Đánh giá chung:** Nhóm làm việc hiệu quả, có sự phối hợp tốt giữa các thành viên.")
+        elif overall_score >= 0.5:
+            feedback_parts.append("⚠️ **Đánh giá chung:** Nhóm có sự cố gắng nhưng cần cải thiện một số khía cạnh về phối hợp.")
+        else:
+            feedback_parts.append("❌ **Đánh giá chung:** Cần có sự cải thiện đáng kể trong cách làm việc nhóm.")
+
+        feedback_parts.append("\n---")
+        feedback_parts.append("### 1️⃣ MỨC ĐỘ THAM GIA CỦA CÁC THÀNH VIÊN")
+        if participation.get('status') not in ['insufficient_data', 'no_speaker_data']:
+            feedback_parts.append(f"**Trạng thái:** {participation.get('status_text', 'N/A')}")
+            feedback_parts.append(f"**Điểm cân bằng:** {participation.get('balance_score', 0):.2f}/1.0")
+
+            feedback_parts.append("\n**Chi tiết từng thành viên:**")
+            for speaker in participation.get('speakers', []):
+                feedback_parts.append(
+                    f"- {speaker['name']}: {speaker['word_count']} từ ({speaker['word_percentage']:.1f}%), "
+                    f"{speaker['segment_count']} đoạn, {speaker['duration_seconds']:.1f}s)"
+                )
+
+            outliers = participation.get('outliers', [])
+            if outliers:
+                feedback_parts.append("\n**⚠️ Vấn đề phân bổ:**")
+                for outlier in outliers:
+                    feedback_parts.append(f"- {outlier}")
+
+            if participation.get('balance_score', 0) < 0.6:
+                feedback_parts.append("\n**💡 Gợi ý:**")
+                feedback_parts.append("- Các thành viên nên phân chia nội dung công bằng hơn")
+                feedback_parts.append("- Người nói ít nên được giao phần trình bày nhiều hơn")
+        else:
+            feedback_parts.append("Không đủ dữ liệu để phân tích.")
+
+        feedback_parts.append("\n---")
+        feedback_parts.append("### 2️⃣ SỰ CHUYỂN LƯỢT GIỮA CÁC THÀNH VIÊN")
+        if transitions.get('status') != 'insufficient_data':
+            feedback_parts.append(f"**Trạng thái:** {transitions.get('status_text', 'N/A')}")
+            feedback_parts.append(f"**Điểm chuyển lượt:** {transitions.get('transition_score', 0):.2f}/1.0")
+            feedback_parts.append(f"**Tổng số lần chuyển lượt:** {transitions.get('total_transitions', 0)}")
+            feedback_parts.append(f"**Mẫu chuyển lượt:** {transitions.get('pattern', 'N/A')}")
+
+            if transitions.get('transition_score', 0) < 0.5:
+                feedback_parts.append("\n**💡 Gợi ý:**")
+                feedback_parts.append("- Các thành viên nên chuyển lượt mượt mà hơn")
+                feedback_parts.append("- Sử dụng câu chuyển tiếp: 'Xin nhường cho bạn X', 'Tiếp theo là phần của...'")
+        else:
+            feedback_parts.append("Không đủ dữ liệu để phân tích.")
+
+        feedback_parts.append("\n---")
+        feedback_parts.append("### 3️⃣ SỰ TIẾP NỐI NỘI DUNG GIỮA CÁC THÀNH VIÊN")
+        if continuity.get('status') != 'insufficient_data':
+            feedback_parts.append(f"**Trạng thái:** {continuity.get('status_text', 'N/A')}")
+            feedback_parts.append(f"**Điểm tiếp nối:** {continuity.get('continuity_score', 0):.2f}/1.0")
+            feedback_parts.append(f"**Số lần chuyển chủ đề:** {continuity.get('topic_matches', 0)}/{continuity.get('total_speaker_transitions', 0)}")
+
+            if continuity.get('continuity_score', 0) < 0.5:
+                feedback_parts.append("\n**💡 Gợi ý:**")
+                feedback_parts.append("- Các thành viên nên lắng nghe và tiếp nối ý của người trước")
+                feedback_parts.append("- Tránh lặp lại nội dung đã được trình bày")
+        else:
+            feedback_parts.append("Không đủ dữ liệu để phân tích.")
+
+        feedback_parts.append("\n---")
+        feedback_parts.append("### 📋 TỔNG KẾT")
+        feedback_parts.append(f"**Điểm teamwork tổng thể:** {overall_score:.2f}/1.0")
+
+        if overall_score >= 0.8:
+            rating_text = "Xuất sắc"
+        elif overall_score >= 0.6:
+            rating_text = "Tốt"
+        elif overall_score >= 0.4:
+            rating_text = "Trung bình"
+        else:
+            rating_text = "Cần cải thiện"
+
+        feedback_parts.append(f"**Xếp loại:** {rating_text}")
+
+        return "\n".join(feedback_parts)
+
+
+# ============================================================
+# Helper class for teamwork results
+# ============================================================
+
+class TeamworkAnalysisResult:
+    """Result of teamwork analysis"""
+    def __init__(
+        self,
+        participation_balance: Dict[str, Any],
+        speaker_transitions: Dict[str, Any],
+        topic_continuity: Dict[str, Any],
+        overall_teamwork_score: float,
+        feedback: str
+    ):
+        self.participation_balance = participation_balance
+        self.speaker_transitions = speaker_transitions
+        self.topic_continuity = topic_continuity
+        self.overall_teamwork_score = overall_teamwork_score
+        self.feedback = feedback
+
 
 # Singleton instance
 _report_analysis_service = None
 
-def get_report_analysis_service(db_service: DatabaseService = None) -> ReportAnalysisService:
+def get_report_analysis_service(db_service: DatabaseService = None) -> 'ReportAnalysisService':
     """Get report analysis service singleton"""
     global _report_analysis_service
     if _report_analysis_service is None:
@@ -647,5 +988,3 @@ def get_report_analysis_service(db_service: DatabaseService = None) -> ReportAna
             db_service = get_database_service()
         _report_analysis_service = ReportAnalysisService(db_service)
     return _report_analysis_service
-
-from src.services.database_service import get_database_service
