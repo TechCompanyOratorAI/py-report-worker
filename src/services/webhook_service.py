@@ -19,10 +19,9 @@ class WebhookService:
     """Service for sending webhooks"""
     
     def __init__(self):
-        # Hardcode for local testing - TODO: remove in production
         self.base_url = os.getenv('WEBHOOK_URL', 'http://localhost:8080/api/v1')
-        self.secret = os.getenv('WEBHOOK_SECRET') or settings.WEBHOOK_SECRET
-        self.timeout = 30  # seconds
+        self.secret = os.getenv('WEBHOOK_SECRET')
+        self.timeout = 30
         
     def _generate_signature(self, payload: str) -> str:
         """Generate HMAC signature for webhook payload"""

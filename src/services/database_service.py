@@ -2,7 +2,6 @@
 Database service for accessing and storing presentation analysis data
 """
 
-import os
 import json
 import mysql.connector
 from mysql.connector import Error as MySQLError
@@ -28,6 +27,10 @@ class PresentationData:
     transcript_segments: List[Dict[str, Any]]
     slides: List[Dict[str, Any]]
     job_id: Optional[int] = None
+    course_id: Optional[int] = None
+    course_name: Optional[str] = None
+    course_description: Optional[str] = None
+    topic_requirements: Optional[str] = None
 
 @dataclass
 class SegmentAnalysisResult:
@@ -66,11 +69,11 @@ class DatabaseService:
         """Connect to MySQL database"""
         try:
             self.connection = mysql.connector.connect(
-                host=os.getenv('DB_HOST', settings.DB_HOST),
-                port=int(os.getenv('DB_PORT', '3306')),
-                database=os.getenv('DB_DATABASE_NAME', settings.DB_NAME),
-                user=os.getenv('DB_USERNAME', settings.DB_USER),
-                password=os.getenv('DB_PASSWORD', settings.DB_PASSWORD),
+                host=settings.DB_HOST,
+                port=settings.DB_PORT,
+                database=settings.DB_NAME,
+                user=settings.DB_USER,
+                password=settings.DB_PASSWORD,
                 ssl_disabled=not settings.DB_SSL,
                 autocommit=True
             )
@@ -113,9 +116,14 @@ class DatabaseService:
                     p.description,
                     p.topicId,
                     t.topicName,
-                    t.description as topicDescription
+                    t.description as topicDescription,
+                    t.requirements as topicRequirements,
+                    c.courseId,
+                    c.courseName,
+                    c.description as courseDescription
                 FROM Presentations p
                 JOIN Topics t ON p.topicId = t.topicId
+                JOIN Courses c ON t.courseId = c.courseId
                 WHERE p.presentationId = %s
             """, (presentation_id,))
             
@@ -176,6 +184,10 @@ class DatabaseService:
                 topic_id=presentation_row['topicId'],
                 topic_name=presentation_row['topicName'],
                 topic_description=presentation_row['topicDescription'],
+                topic_requirements=presentation_row.get('topicRequirements'),
+                course_id=presentation_row.get('courseId'),
+                course_name=presentation_row.get('courseName'),
+                course_description=presentation_row.get('courseDescription'),
                 transcript_segments=transcript_segments,
                 slides=slides,
                 job_id=job_id
@@ -324,6 +336,40 @@ class DatabaseService:
         except MySQLError as e:
             raise DatabaseError(f"Failed to save analysis results: {e}")
     
+    def get_analysis_results(self, presentation_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get overall analysis results for a presentation
+        
+        Args:
+            presentation_id: Presentation ID
+            
+        Returns:
+            Dict with analysis results or None if not found
+        """
+        self._ensure_connection()
+        
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            
+            cursor.execute("""
+                SELECT 
+                    resultId,
+                    presentationId,
+                    overallScore,
+                    analyzedAt,
+                    processingTimeSeconds,
+                    status
+                FROM AnalysisResults 
+                WHERE presentationId = %s
+            """, (presentation_id,))
+            
+            result = cursor.fetchone()
+            cursor.close()
+            return result
+            
+        except MySQLError as e:
+            raise DatabaseError(f"Failed to get analysis results: {e}")
+    
     def check_presentation_exists(self, presentation_id: int) -> bool:
         """Check if presentation exists"""
         self._ensure_connection()
@@ -390,6 +436,20 @@ class DatabaseService:
         # Map ai_report to general (since feedbackType is ENUM)
         if feedback_type == "ai_report":
             feedback_type = "general"
+        
+        # Map teamwork to general if not supported by DB ENUM
+        # (will be stored as general but can be filtered in queries)
+        if feedback_type == "teamwork":
+            # Check if 'teamwork' is supported, fallback to 'general'
+            try:
+                cursor = self.connection.cursor()
+                cursor.execute("SHOW COLUMNS FROM Feedback LIKE 'feedbackType'")
+                result = cursor.fetchone()
+                cursor.close()
+                if result and 'teamwork' not in str(result):
+                    feedback_type = "general"
+            except:
+                feedback_type = "general"
 
         # If no reviewer_id (AI), use 24 as placeholder since reviewerId is NOT NULL
         # (userId 24 is used as system/AI placeholder)
@@ -536,6 +596,65 @@ class DatabaseService:
 
         except MySQLError as e:
             raise DatabaseError(f"Failed to get segment analyses for feedback: {e}")
+
+    def get_transcript_with_speakers(self, presentation_id: int) -> Dict[str, Any]:
+        """
+        Get transcript segments with speaker information for teamwork analysis
+
+        Args:
+            presentation_id: Presentation ID
+
+        Returns:
+            Dict with segments, speakers, and analysis data
+        """
+        self._ensure_connection()
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+
+            # Get transcript segments with speaker info
+            cursor.execute("""
+                SELECT
+                    ts.segmentId,
+                    ts.segmentNumber,
+                    ts.startTimestamp,
+                    ts.endTimestamp,
+                    ts.segmentText,
+                    ts.wordCount,
+                    s.speakerId,
+                    s.aiSpeakerLabel as speakerName
+                FROM TranscriptSegments ts
+                JOIN Transcripts t ON ts.transcriptId = t.transcriptId
+                LEFT JOIN Speakers s ON ts.speakerId = s.speakerId
+                WHERE t.presentationId = %s
+                ORDER BY ts.segmentNumber ASC
+            """, (presentation_id,))
+
+            segments = cursor.fetchall()
+
+            # Get unique speakers
+            cursor.execute("""
+                SELECT DISTINCT
+                    s.speakerId,
+                    s.aiSpeakerLabel as speakerName
+                FROM TranscriptSegments ts
+                JOIN Transcripts t ON ts.transcriptId = t.transcriptId
+                LEFT JOIN Speakers s ON ts.speakerId = s.speakerId
+                WHERE t.presentationId = %s AND s.speakerId IS NOT NULL
+            """, (presentation_id,))
+
+            speakers = cursor.fetchall()
+
+            cursor.close()
+
+            return {
+                "segments": segments or [],
+                "speakers": speakers or [],
+                "segment_count": len(segments)
+            }
+
+        except MySQLError as e:
+            raise DatabaseError(f"Failed to get transcript with speakers: {e}")
 
     def close(self):
         """Close database connection"""

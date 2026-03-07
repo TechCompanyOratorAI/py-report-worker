@@ -16,7 +16,10 @@ python-dotenv>=1.0.0
 python-dateutil>=2.8.0
 coloredlogs>=15.0.0
 
-# AI - Gemini
+# AI - OpenAI
+openai>=1.0.0
+
+# AI - Gemini (Legacy)
 google-genai>=1.0.0
 
 # API Server

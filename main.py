@@ -1,9 +1,8 @@
 """
 Report Worker - Main Entry Point
 
-This worker polls messages from AWS SQS report queue, performs analysis
-on transcript segments against slides and topic, saves results to database
-(SegmentAnalyses and AnalysisResults tables), then sends webhook to API.
+Polls messages from AWS SQS queue, performs analysis on transcript segments,
+saves results to database, then sends webhook to API.
 """
 
 import sys
@@ -16,13 +15,7 @@ sys.path.insert(0, 'src')
 
 from config.settings import settings
 from utils.logger import get_logger
-from utils.exceptions import (
-    ReportWorkerError,
-    DatabaseError,
-    SQSError,
-    WebhookError,
-    AnalysisError
-)
+from utils.exceptions import DatabaseError, AnalysisError
 
 # Import services
 from services.sqs_service import get_sqs_service, SQSMessage
@@ -53,157 +46,74 @@ class ReportWorker:
     
     def start(self):
         """Start the worker"""
-        print("DEBUG: start() called", file=sys.stderr, flush=True)
-        
-        logger.info("=" * 80)
-        logger.info(f"🚀 Starting {self.worker_name}")
-        logger.info("=" * 80)
-        logger.info(f"📊 Configuration:")
+        logger.info(f"🚀 Starting {settings.WORKER_ID}")
         logger.info(f"   - SQS Queue: {settings.AWS_SQS_REPORT_QUEUE_URL}")
-        logger.info(f"   - Poll Interval: {settings.POLL_INTERVAL}s")
-        logger.info(f"   - Max Messages: {settings.MAX_MESSAGES}")
-        logger.info(f"   - Similarity Threshold: {settings.SIMILARITY_THRESHOLD}")
-        logger.info(f"   - Relevance Threshold: {settings.RELEVANCE_THRESHOLD}")
-        logger.info(f"   - Alignment Threshold: {settings.ALIGNMENT_THRESHOLD}")
-        logger.info("=" * 80)
         
         # Validate configuration
         try:
-            print("DEBUG: Validating configuration...", file=sys.stderr, flush=True)
             settings.validate()
             logger.info("✅ Configuration validated")
-            print("DEBUG: Configuration validated", file=sys.stderr, flush=True)
         except ValueError as e:
-            logger.error(f"❌ Configuration validation failed: {e}")
-            print(f"ERROR: Configuration validation failed: {e}", file=sys.stderr, flush=True)
+            logger.error(f"❌ Configuration error: {e}")
             sys.exit(1)
         
         # Initialize services
-        try:
-            print("DEBUG: About to initialize services...", file=sys.stderr, flush=True)
-            self._initialize_services()
-            print("DEBUG: Services initialized successfully", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"ERROR: During InitializationError: {e}", file=sys.stderr, flush=True)
-            logger.error(f"❌ Fatal error during initialization: {e}", exc_info=True)
-            import traceback
-            traceback.print_exc(file=sys.stderr)
-            self.stop()
-            sys.exit(1)
-        
-        print("DEBUG: Setting running = True", file=sys.stderr, flush=True)
+        self._initialize_services()
         self.running = True
         
-        print("DEBUG: About to enter polling loop...", file=sys.stderr, flush=True)
-        try:
-            self._run_loop()
-        except KeyboardInterrupt:
-            logger.info("⚠️ Received keyboard interrupt")
-            self.stop()
-        except Exception as e:
-            logger.error(f"❌ Fatal error: {e}", exc_info=True)
-            print(f"ERROR: Fatal error in run_loop: {e}", file=sys.stderr, flush=True)
-            self.stop()
-            sys.exit(1)
+        # Start polling loop
+        self._run_loop()
     
     def _initialize_services(self):
         """Initialize all services"""
-        try:
-            logger.info("🔧 Initializing services...")
-            print("DEBUG: [1/5] Getting SQS service...", file=sys.stderr, flush=True)
-            self.sqs_service = get_sqs_service()
-            print("DEBUG: [2/5] SQS service ready", file=sys.stderr, flush=True)
-            logger.info("   ✅ SQS Service ready")
-            
-            print("DEBUG: [3/5] Getting Database service...", file=sys.stderr, flush=True)
-            # Database Service
-            self.database_service = get_database_service()
-            print("DEBUG: [4/5] Database service ready", file=sys.stderr, flush=True)
-            logger.info("   ✅ Database Service ready")
-            
-            print("DEBUG: [5/5] Getting Webhook service...", file=sys.stderr, flush=True)
-            # Webhook Service
-            self.webhook_service = get_webhook_service()
-            print("DEBUG: [6/5] Webhook service ready", file=sys.stderr, flush=True)
-            
-            # Test webhook connectivity
-            if self.webhook_service.test_connection():
-                logger.info("   ✅ Webhook Service ready")
-            else:
-                logger.warning("   ⚠️ Webhook Service initialized but endpoint not reachable")
-            print("DEBUG: [7/5] About to get Report Analysis service...", file=sys.stderr, flush=True)
-            
-            # Report Analysis Service
-            self.report_service = get_report_analysis_service(self.database_service)
-            print("DEBUG: [8/5] Report Analysis service ready", file=sys.stderr, flush=True)
-            logger.info("   ✅ Report Analysis Service ready")
-            
-            logger.info("✅ All services initialized successfully")
-            print("DEBUG: All services initialized!", file=sys.stderr, flush=True)
-            
-        except Exception as e:
-            error_msg = f"Failed to initialize services: {e}"
-            print(f"DEBUG ERROR: {error_msg}", file=sys.stderr, flush=True)
-            logger.error(f"❌ {error_msg}", exc_info=True)
-            import traceback
-            print("\n=== TRACEBACK ===", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
-            print("=== END TRACEBACK ===\n", file=sys.stderr, flush=True)
-            raise
+        logger.info("🔧 Initializing services...")
+        
+        self.sqs_service = get_sqs_service()
+        self.database_service = get_database_service()
+        self.webhook_service = get_webhook_service()
+        
+        # Test webhook connectivity
+        if self.webhook_service.test_connection():
+            logger.info("   ✅ Webhook Service ready")
+        
+        # Report Analysis Service
+        self.report_service = get_report_analysis_service(self.database_service)
+        logger.info("✅ All services initialized")
     
     def _run_loop(self):
         """Main worker loop - poll and process messages"""
-        print("[RUNNING] ENTERED WORKER LOOP - polling SQS...")
         logger.info("🔄 Worker started, polling for messages...")
-        logger.info("")
-        
-        poll_count = 0
         
         while self.running:
             try:
-                # Poll SQS for messages
                 messages = self.sqs_service.poll_messages(
                     max_messages=settings.MAX_MESSAGES,
                     wait_time_seconds=settings.WAIT_TIME_SECONDS
                 )
                 
-                poll_count += 1
                 if not messages:
-                    if poll_count % 3 == 0:  
-                        logger.info(f"⏳ Waiting for messages... (poll #{poll_count})")
                     continue
-                poll_count = 0
+                    
                 for message in messages:
                     self._process_message(message)
-                
+            
             except KeyboardInterrupt:
-                raise
+                logger.info("⚠️ Received keyboard interrupt")
+                self.stop()
             except Exception as e:
-                logger.error(f"❌ Error in worker loop: {e}", exc_info=True)
+                logger.error(f"❌ Error in worker loop: {e}")
                 time.sleep(settings.POLL_INTERVAL)
     
     def _process_message(self, message: SQSMessage):
-        """
-        Process a single SQS message
-        
-        Args:
-            message: SQSMessage object
-        """
+        """Process a single SQS message"""
         job_id = message.job_id
         presentation_id = message.presentation_id
         
-        logger.info("")
-        logger.info("=" * 80)
-        logger.info(f"🎯 Processing Report Job {job_id}")
-        logger.info("=" * 80)
-        logger.info(f"   - Presentation ID: {presentation_id}")
-        logger.info(f"   - Message ID: {message.message_id}")
+        logger.info(f"🎯 Processing Job {job_id} - Presentation {presentation_id}")
         
-        # Track processing time
         start_time = time.time()
         
         try:
-            # Process the report job
             result = self._process_report_job(
                 job_id=job_id,
                 presentation_id=presentation_id,
@@ -211,13 +121,10 @@ class ReportWorker:
                 start_time=start_time
             )
             
-            # Calculate processing time
             processing_time = time.time() - start_time
             result['metadata']['processingTime'] = round(processing_time, 2)
-            result['metadata']['processingTimeSeconds'] = round(processing_time, 2)
             
             # Send success webhook
-            logger.info(f"📤 Sending success webhook...")
             self.webhook_service.send_report_complete(
                 job_id=job_id,
                 presentation_id=presentation_id,
@@ -226,52 +133,31 @@ class ReportWorker:
                 metadata=result['metadata']
             )
             
-            # Delete message from queue (success)
-            logger.info(f"🗑️ Deleting message from queue...")
+            # Delete message from queue
             self.sqs_service.delete_message(message)
             
             # Update statistics
             self.jobs_processed += 1
             self.jobs_succeeded += 1
             
-            logger.info("=" * 80)
-            logger.info(f"✅ Job {job_id} completed successfully in {processing_time:.2f}s")
-            logger.info(f"📊 Stats: {self.jobs_succeeded} succeeded, {self.jobs_failed} failed, {self.jobs_processed} total")
-            logger.info("=" * 80)
-            logger.info("")
+            logger.info(f"✅ Job {job_id} completed in {processing_time:.2f}s")
             
         except Exception as e:
-            # Calculate processing time
             processing_time = time.time() - start_time
-            
-            logger.error("=" * 80)
-            logger.error(f"❌ Job {job_id} failed after {processing_time:.2f}s")
-            logger.error(f"❌ Error: {e}", exc_info=True)
-            logger.error("=" * 80)
+            logger.error(f"❌ Job {job_id} failed: {e}")
             
             # Send failure webhook
             try:
-                logger.warning(f"📤 Sending failure webhook...")
                 self.webhook_service.send_report_failed(
                     job_id=job_id,
                     presentation_id=presentation_id,
-                    error_message=str(e),
-                    error_details={
-                        'error_type': type(e).__name__,
-                        'processing_time': round(processing_time, 2)
-                    }
+                    error_message=str(e)
                 )
             except Exception as webhook_error:
-                logger.error(f"❌ Failed to send failure webhook: {webhook_error}")
+                logger.error(f"❌ Failed to send webhook: {webhook_error}")
             
-            # Update statistics
             self.jobs_processed += 1
             self.jobs_failed += 1
-            
-            # DO NOT delete message - allow retry after visibility timeout
-            logger.warning(f"⚠️ Message NOT deleted - will retry after visibility timeout")
-            logger.info(f"📊 Stats: {self.jobs_succeeded} succeeded, {self.jobs_failed} failed, {self.jobs_processed} total")
-            logger.info("")
     
     def _process_report_job(
         self,
@@ -280,36 +166,20 @@ class ReportWorker:
         metadata: Dict[str, Any],
         start_time: float
     ) -> Dict[str, Any]:
-        """
-        Process report generation job
+        """Process report generation job"""
         
-        Args:
-            job_id: Job ID
-            presentation_id: Presentation ID
-            metadata: Job metadata
-            start_time: Start time for calculating processing duration
-            
-        Returns:
-            Dictionary with analysis results
-        """
         # Step 1: Get presentation data
-        logger.info(f"📥 Step 1/5: Loading presentation data...")
+        logger.info(f"📥 Loading presentation data...")
         presentation_data = self.database_service.get_presentation_data(presentation_id)
         
         if not presentation_data:
-            raise DatabaseError(f"Presentation {presentation_id} not found or incomplete")
-        
-        logger.info(f"   - Title: {presentation_data.title}")
-        logger.info(f"   - Topic: {presentation_data.topic_name}")
-        logger.info(f"   - Transcript segments: {len(presentation_data.transcript_segments)}")
-        logger.info(f"   - Slides: {len(presentation_data.slides)}")
+            raise DatabaseError(f"Presentation {presentation_id} not found")
         
         if not presentation_data.transcript_segments:
-            raise AnalysisError("No transcript segments found for analysis")
+            raise AnalysisError("No transcript segments found")
         
         # Step 2: Perform analysis
-        logger.info(f"🔍 Step 2/5: Performing segment analysis...")
-        
+        logger.info(f"🔍 Analyzing segments...")
         segment_analyses_obj, overall_scores_obj = self.report_service.analyze_presentation(presentation_data)
         
         # Convert to API format
@@ -335,11 +205,11 @@ class ReportWorker:
             'overallScore': overall_scores_obj.overall_score
         }
         
-        # Step 3: Save segment analyses to database
-        logger.info(f"💾 Step 3/5: Saving segment analyses to database...")
+        # Step 3: Save segment analyses
+        logger.info(f"💾 Saving segment analyses...")
+        segment_processing_time = time.time() - start_time
         
-        for i, analysis in enumerate(segment_analyses_obj):
-            # Get slide_id for best matching slide
+        for analysis in segment_analyses_obj:
             slide_id = None
             if analysis.best_matching_slide > 0:
                 for slide in presentation_data.slides:
@@ -347,117 +217,104 @@ class ReportWorker:
                         slide_id = slide.get('slideId')
                         break
             
-            # Estimate processing time per segment (in milliseconds)
-            segment_processing_time = time.time() - start_time
             processing_time_ms = int((segment_processing_time / len(segment_analyses_obj)) * 1000)
-            
             self.database_service.save_segment_analysis(analysis, slide_id, processing_time_ms)
         
-        logger.info(f"   - Saved {len(segment_analyses)} segment analyses")
-        
-        # Step 4: Save overall results to database
-        logger.info(f"💾 Step 4/4: Saving overall results to database...")
-
+        # Step 4: Save overall results
         result_id = self.database_service.save_analysis_results(
             presentation_id,
             overall_scores_obj,
             processing_time_seconds=round(segment_processing_time, 2),
             ai_model_version="report-worker-v1"
         )
-        logger.info(f"   - Saved AnalysisResults: resultId={result_id}")
-
-        # Step 5: Generate and save AI feedback
-        logger.info(f"🤖 Step 5/5: Generating AI feedback...")
-
+        
+        # Step 5: Generate AI feedback
+        logger.info(f"🤖 Generating AI feedback...")
+        
         try:
-            # Get data for feedback generation
             feedback_data = self.database_service.get_segment_analyses_for_feedback(presentation_id)
-
+            
             if feedback_data["segment_analyses"] and feedback_data["overall_scores"]:
-                # Generate feedback using Gemini
                 feedback_result = self.report_service.generate_feedback(
                     presentation_title=presentation_data.title,
                     topic_name=presentation_data.topic_name,
                     topic_description=presentation_data.topic_description or "",
                     segment_analyses=feedback_data["segment_analyses"],
-                    overall_scores=feedback_data["overall_scores"]
+                    overall_scores=feedback_data["overall_scores"],
+                    course_name=presentation_data.course_name,
+                    course_description=presentation_data.course_description,
+                    topic_requirements=presentation_data.topic_requirements
                 )
-
-                # Save feedback to database
-                feedback_id = self.database_service.save_feedback(
+                
+                self.database_service.save_feedback(
                     presentation_id=presentation_id,
                     rating=feedback_result['overall_score'],
                     comments=feedback_result['comments'],
                     feedback_type=feedback_result.get('feedback_type', 'ai_report'),
-                    reviewer_id=None,  # AI-generated
+                    reviewer_id=None,
                     is_visible_to_student=True
                 )
-
-                logger.info(f"   - Saved Feedback: feedbackId={feedback_id}, rating={feedback_result['overall_score']}")
-            else:
-                logger.warning(f"   - Skipped feedback generation: missing data")
-
         except Exception as e:
-            logger.error(f"   - Failed to generate/save feedback: {e}")
-            # Don't fail the whole job if feedback generation fails
+            logger.error(f"   - Failed to generate feedback: {e}")
         
-        # Format metadata
-        result_metadata = {
-            'totalSegments': len(segment_analyses),
-            'totalSlides': len(presentation_data.slides),
-            'topicName': presentation_data.topic_name,
-            'topicDescription': presentation_data.topic_description,
-            'jobId': job_id,
-            'resultId': result_id,
-            'aiModelVersion': 'report-worker-v1',
-            'processingTimeSeconds': round(segment_processing_time, 2)
-        }
+        # Step 6: Generate Teamwork Analysis feedback
+        logger.info(f"👥 Analyzing teamwork...")
         
-        logger.info(f"✅ Report generation complete:")
-        logger.info(f"   - Analyzed segments: {len(segment_analyses)}")
-        logger.info(f"   - Content relevance: {overall_scores['contentRelevance']:.2f}")
-        logger.info(f"   - Semantic similarity: {overall_scores['semanticSimilarity']:.2f}")
-        logger.info(f"   - Slide alignment: {overall_scores['slideAlignment']:.2f}")
+        try:
+            transcript_data = self.database_service.get_transcript_with_speakers(presentation_id)
+            
+            if transcript_data["segments"] and len(transcript_data["speakers"]) >= 2:
+                teamwork_result = self.report_service.analyze_teamwork(transcript_data)
+                
+                # Save teamwork feedback
+                self.database_service.save_feedback(
+                    presentation_id=presentation_id,
+                    rating=teamwork_result.overall_teamwork_score,
+                    comments=teamwork_result.feedback,
+                    feedback_type='teamwork',  # Different feedback type
+                    reviewer_id=None,
+                    is_visible_to_student=True
+                )
+                
+                logger.info(f"   ✅ Teamwork analysis saved: score={teamwork_result.overall_teamwork_score:.2f}")
+            else:
+                logger.info(f"   - Skipped teamwork analysis: not enough speakers ({len(transcript_data['speakers'])})")
+        except Exception as e:
+            logger.error(f"   - Failed to analyze teamwork: {e}")
         
         return {
             'segmentAnalyses': segment_analyses,
             'overallScores': overall_scores,
-            'metadata': result_metadata
+            'metadata': {
+                'totalSegments': len(segment_analyses),
+                'totalSlides': len(presentation_data.slides),
+                'jobId': job_id,
+                'resultId': result_id
+            }
         }
     
     def stop(self):
         """Stop the worker gracefully"""
-        logger.info("")
-        logger.info("=" * 80)
         logger.info(f"🛑 Stopping {self.worker_name}...")
-        logger.info(f"📊 Final Stats:")
-        logger.info(f"   - Jobs succeeded: {self.jobs_succeeded}")
-        logger.info(f"   - Jobs failed: {self.jobs_failed}")
-        logger.info(f"   - Jobs total: {self.jobs_processed}")
-        logger.info("=" * 80)
         self.running = False
         
-        # Close database connection
         if self.database_service:
             self.database_service.close()
 
 
 def signal_handler(signum, frame):
     """Handle shutdown signals"""
-    logger.info(f"⚠️ Received signal {signum}")
     sys.exit(0)
 
 
 def main():
     """Main entry point"""
-    print("[RUNNING] APP IS RUNNING...")
-    # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Create and start worker
     worker = ReportWorker()
     worker.start()
+
 
 if __name__ == "__main__":
     main()
