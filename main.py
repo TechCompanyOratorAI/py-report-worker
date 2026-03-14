@@ -204,43 +204,19 @@ class ReportWorker:
             'slideAlignment': overall_scores_obj.slide_alignment,
             'overallScore': overall_scores_obj.overall_score
         }
-        
-        # Step 3: Save segment analyses
-        logger.info(f"💾 Saving segment analyses...")
-        segment_processing_time = time.time() - start_time
-        
-        for analysis in segment_analyses_obj:
-            slide_id = None
-            if analysis.best_matching_slide > 0:
-                for slide in presentation_data.slides:
-                    if slide.get('slideNumber') == analysis.best_matching_slide:
-                        slide_id = slide.get('slideId')
-                        break
-            
-            processing_time_ms = int((segment_processing_time / len(segment_analyses_obj)) * 1000)
-            self.database_service.save_segment_analysis(analysis, slide_id, processing_time_ms)
-        
-        # Step 4: Save overall results
-        result_id = self.database_service.save_analysis_results(
-            presentation_id,
-            overall_scores_obj,
-            processing_time_seconds=round(segment_processing_time, 2),
-            ai_model_version="report-worker-v1"
-        )
-        
-        # Step 5: Generate AI feedback
+
+        # Step 3: Generate AI feedback
         logger.info(f"🤖 Generating AI feedback...")
         
         try:
-            feedback_data = self.database_service.get_segment_analyses_for_feedback(presentation_id)
-            
-            if feedback_data["segment_analyses"] and feedback_data["overall_scores"]:
+            # Use segment analyses from memory instead of reading from database
+            if segment_analyses and overall_scores:
                 feedback_result = self.report_service.generate_feedback(
                     presentation_title=presentation_data.title,
                     topic_name=presentation_data.topic_name,
                     topic_description=presentation_data.topic_description or "",
-                    segment_analyses=feedback_data["segment_analyses"],
-                    overall_scores=feedback_data["overall_scores"],
+                    segment_analyses=segment_analyses,
+                    overall_scores=overall_scores,
                     course_name=presentation_data.course_name,
                     course_description=presentation_data.course_description,
                     topic_requirements=presentation_data.topic_requirements
@@ -257,7 +233,7 @@ class ReportWorker:
         except Exception as e:
             logger.error(f"   - Failed to generate feedback: {e}")
         
-        # Step 6: Generate Teamwork Analysis feedback
+        # Step 4: Generate Teamwork Analysis feedback
         logger.info(f"👥 Analyzing teamwork...")
         
         try:
@@ -288,8 +264,7 @@ class ReportWorker:
             'metadata': {
                 'totalSegments': len(segment_analyses),
                 'totalSlides': len(presentation_data.slides),
-                'jobId': job_id,
-                'resultId': result_id
+                'jobId': job_id
             }
         }
     
