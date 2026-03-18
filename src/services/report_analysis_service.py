@@ -955,6 +955,318 @@ Return ONLY the JSON object. No markdown, no explanation."""
 
         return "\n".join(feedback_parts)
 
+    # ============================================================
+    # RUBRIC-BASED SCORING METHODS
+    # ============================================================
+
+    def calculate_rubric_scores(
+        self,
+        presentation_title: str,
+        topic_name: str,
+        topic_description: str,
+        segment_analyses: List[Dict],
+        overall_scores: Dict,
+        speech_quality: Dict = None,
+        hesitation_patterns: List[Dict] = None,
+        segment_speech_quality: List[Dict] = None,
+        analysis_results: Dict = None,
+        rubric_criteria: List[Dict] = None,
+        settings: Dict = None,
+        course_name: str = None,
+        course_description: str = None,
+        topic_requirements: str = None
+    ) -> Dict[str, Any]:
+        """
+        Calculate scores based on rubric criteria using AI
+        
+        Args:
+            presentation_title: Title of the presentation
+            topic_name: Topic name
+            topic_description: Topic description
+            segment_analyses: List of segment analyses from semantic worker
+            overall_scores: Overall scores from semantic analysis
+            speech_quality: Speech quality analysis data
+            hesitation_patterns: List of hesitation patterns
+            segment_speech_quality: Speech quality per segment
+            analysis_results: Overall analysis results with quality metrics
+            rubric_criteria: List of rubric criteria from class
+            settings: AI settings
+            course_name: Course name
+            course_description: Course description
+            topic_requirements: Topic requirements/clearning outcomes
+            
+        Returns:
+            Dict with criterion_scores, report_content, overall_scores
+        """
+        logger.info(f"🎯 Calculating rubric-based scores with {self.ai_provider.upper()} AI...")
+        
+        # Prepare rubric data for prompt
+        rubric_text = ""
+        if rubric_criteria:
+            for idx, criterion in enumerate(rubric_criteria, 1):
+                criteria_name = criterion.get('criteriaName', criterion.get('criteria_name', 'Unknown'))
+                criteria_desc = criterion.get('criteriaDescription', criterion.get('criteria_description', ''))
+                weight = criterion.get('weight', 1.0)
+                max_score = criterion.get('maxScore', 10)
+                eval_guide = criterion.get('evaluationGuide', criterion.get('evaluation_guide', ''))
+                
+                rubric_text += f"""
+{idx}. {criteria_name} (Trọng số: {weight}, Điểm tối đa: {max_score})
+   - Mô tả: {criteria_desc}
+   - Hướng dẫn đánh giá: {eval_guide}
+"""
+        
+        # Prepare speech quality data
+        speech_text = ""
+        if speech_quality:
+            speech_text = f"""
+- Fluency Score: {speech_quality.get('fluencyScore', 'N/A')}
+- Clarity Score: {speech_quality.get('clarityScore', 'N/A')}
+- Confidence Score: {speech_quality.get('confidenceScore', 'N/A')}
+- Overall Speech Score: {speech_quality.get('overallScore', 'N/A')}
+- Total Hesitations: {speech_quality.get('totalHesitationCount', 0)}
+- Hesitation Rate: {speech_quality.get('hesitationRate', 0)}
+"""
+        
+        if hesitation_patterns:
+            speech_text += f"- Hesitation Patterns: {len(hesitation_patterns)} patterns found\n"
+        
+        # Prepare segment analysis summary
+        segment_summary = ""
+        if segment_analyses:
+            total = len(segment_analyses)
+            avg_relevance = sum(float(sa.get('relevanceScore', 0) or 0) for sa in segment_analyses) / total if total > 0 else 0
+            avg_semantic = sum(float(sa.get('semanticScore', 0) or 0) for sa in segment_analyses) / total if total > 0 else 0
+            avg_alignment = sum(float(sa.get('alignmentScore', 0) or 0) for sa in segment_analyses) / total if total > 0 else 0
+            
+            segment_summary = f"""
+- Total Segments Analyzed: {total}
+- Average Relevance Score: {avg_relevance:.2f}/1.0
+- Average Semantic Score: {avg_semantic:.2f}/1.0
+- Average Alignment Score: {avg_alignment:.2f}/1.0
+- Overall Score: {overall_scores.get('overallScore', 0):.2f}/1.0
+"""
+        
+        # Prepare AnalysisResults data
+        analysis_results_text = ""
+        if analysis_results:
+            ar = analysis_results
+            analysis_results_text = f"""
+## Dữ liệu từ AnalysisResults (Kết quả phân tích tổng hợp):
+- Overall Score: {ar.get('overallScore', 'N/A')}
+- Analyzed At: {ar.get('analyzedAt', 'N/A')}
+- AI Model Version: {ar.get('aiModelVersion', 'N/A')}
+- Status: {ar.get('status', 'N/A')}
+
+### Content Quality (Chất lượng nội dung):
+{self._format_quality_data(ar.get('contentQuality'), ['coherenceScore', 'depthScore', 'accuracyScore', 'topicCoverageScore', 'strengths', 'weaknesses'])}
+
+### Delivery Quality (Chất lượng trình bày):
+{self._format_quality_data(ar.get('deliveryQuality'), ['clarityScore', 'pronunciationScore', 'volumeConsistency', 'speechRateWpm', 'voiceQuality'])}
+
+### Structure Quality (Chất lượng cấu trúc):
+{self._format_quality_data(ar.get('structureQuality'), ['organizationScore', 'transitionQuality', 'introConclusionScore', 'logicalFlowScore', 'structureNotes'])}
+
+### Engagement Metrics (Tương tác):
+{self._format_quality_data(ar.get('engagementMetric'), ['enthusiasmScore', 'variationScore', 'rhetoricalDeviceCount', 'emotionalTone'])}
+
+### Speech Patterns (Mẫu giọng nói):
+{self._format_quality_data(ar.get('speechPattern'), ['fillerWordCount', 'avgPauseDuration', 'longPauseCount', 'paceConsistency', 'fillerWordList'])}
+"""
+        
+        # Build course info
+        course_info = ""
+        if course_name:
+            course_info += f"- Tên môn học: {course_name}\n"
+        if course_description:
+            course_info += f"- Mô tả môn học: {course_description}\n"
+        if topic_requirements:
+            course_info += f"- Yêu cầu/Clearning outcomes: {topic_requirements}\n"
+        
+        # Create prompt for rubric-based scoring
+        prompt = f"""Bạn là chuyên gia đánh giá bài thuyết trình. Hãy đánh giá bài thuyết trình này dựa trên rubric được cung cấp.
+
+## Thông tin bài thuyết trình:
+- Tiêu đề: {presentation_title}
+- Chủ đề: {topic_name}
+- Mô tả chủ đề: {topic_description}
+{course_info}
+## Điểm phân tích từ Semantic Worker:
+{segment_summary}
+## Dữ liệu chất lượng giọng nói (Speech Quality):
+{speech_text if speech_text else "Chưa có dữ liệu phân tích giọng nói"}
+{analysis_results_text if analysis_results_text else ""}
+## Rubric Criteria (Tiêu chí đánh giá):
+{rubric_text if rubric_text else "Không có rubric criteria"}
+
+## Yêu cầu:
+1. Đánh giá từng tiêu chí trong rubric dựa trên dữ liệu phân tích
+2. Tính điểm cho mỗi tiêu chí (theo thang điểm tối đa của tiêu chí đó)
+3. Tính điểm tổng kết theo trọng số
+4. Viết nhận xét chi tiết cho từng tiêu chí
+5. Đưa ra gợi ý cải thiện
+
+## Trả về JSON với format sau (KHÔNG có markdown, KHÔNG có giải thích):
+{{
+  "criterion_scores": [
+    {{
+      "criteriaId": <id của tiêu chí>,
+      "criteriaName": "<tên tiêu chí>",
+      "score": <điểm đánh giá>,
+      "maxScore": <điểm tối đa>,
+      "weight": <trọng số>,
+      "comment": "<nhận xét chi tiết bằng tiếng Việt>",
+      "suggestions": ["<gợi ý 1>", "<gợi ý 2>"]
+    }}
+  ],
+  "overallScore": <điểm tổng (0-1)>,
+  "reportContent": "<nội dung báo cáo bằng tiếng Việt, khoảng 800-1500 từ, bao gồm: tổng quan, điểm mạnh, điểm cần cải thiện, gợi ý cụ thể>"
+}}
+
+Lưu ý: 
+- reportContent phải là text thuần (không có markdown formatting)
+- Sử dụng dữ liệu speech quality để đánh giá tiêu chí về kỹ năng thuyết trình
+- Sử dụng segment analyses để đánh giá tiêu chí về nội dung và độ liên quan
+
+Return ONLY the JSON object. No markdown, no explanation."""
+
+        try:
+            result_text = self._call_ai(prompt)
+            
+            # Parse AI response
+            if result_text.startswith('```'):
+                result_text = result_text.split('```')[1]
+                if result_text.startswith('json'):
+                    result_text = result_text[4:]
+            result_text = result_text.strip().strip('`')
+            
+            # Clean up any non-printable characters
+            result_text = ''.join(char for char in result_text if ord(char) >= 32 or char in '\n\t\r')
+            
+            result = json.loads(result_text)
+            
+            criterion_scores = result.get('criterion_scores', [])
+            report_content = result.get('reportContent', '')
+            overall_score = result.get('overallScore', overall_scores.get('overallScore', 0) if overall_scores else 0)
+            
+            # Convert criterion scores to dict format
+            criterion_scores_dict = {}
+            for cs in criterion_scores:
+                criteria_id = cs.get('criteriaId')
+                if criteria_id:
+                    criterion_scores_dict[str(criteria_id)] = cs
+            
+            logger.info(f"✅ Rubric-based scoring complete: {len(criterion_scores)} criteria scored")
+            
+            # Update overall scores with rubric-based score
+            updated_overall_scores = {
+                'overallScore': overall_score,
+                'contentRelevance': overall_scores.get('contentRelevance', 0) if overall_scores else 0,
+                'semanticSimilarity': overall_scores.get('semanticSimilarity', 0) if overall_scores else 0,
+                'slideAlignment': overall_scores.get('slideAlignment', 0) if overall_scores else 0,
+                'rubricBased': True
+            }
+            
+            return {
+                'criterion_scores': criterion_scores_dict,
+                'report_content': report_content,
+                'overall_scores': updated_overall_scores
+            }
+            
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse AI rubric response: {e}")
+            return self._calculate_rubric_scores_fallback(
+                segment_analyses, 
+                overall_scores, 
+                speech_quality,
+                analysis_results,
+                rubric_criteria
+            )
+        except Exception as e:
+            logger.warning(f"AI API error in rubric scoring: {e}")
+            return self._calculate_rubric_scores_fallback(
+                segment_analyses, 
+                overall_scores, 
+                speech_quality,
+                analysis_results,
+                rubric_criteria
+            )
+
+    def _format_quality_data(self, data: Dict, fields: List[str]) -> str:
+        """Format quality data for AI prompt"""
+        if not data:
+            return "Chưa có dữ liệu"
+        
+        lines = []
+        for field in fields:
+            value = data.get(field)
+            if value is not None and value != '':
+                # Format field name for display
+                field_display = field.replace('Score', ' Score').replace('Count', ' Count')
+                lines.append(f"- {field_display}: {value}")
+        
+        return "\n".join(lines) if lines else "Chưa có dữ liệu"
+
+    def _calculate_rubric_scores_fallback(
+        self,
+        segment_analyses: List[Dict],
+        overall_scores: Dict,
+        speech_quality: Dict,
+        analysis_results: Dict = None,
+        rubric_criteria: List[Dict] = None
+    ) -> Dict[str, Any]:
+        """Fallback calculation if AI fails"""
+        logger.info("🔄 Using fallback rubric scoring...")
+        
+        criterion_scores = {}
+        
+        if rubric_criteria:
+            base_score = overall_scores.get('overallScore', 0) if overall_scores else 0
+            
+            for criterion in rubric_criteria:
+                criteria_id = criterion.get('criteriaId', criterion.get('criteria_id'))
+                criteria_name = criterion.get('criteriaName', criterion.get('criteria_name', 'Unknown'))
+                max_score = criterion.get('maxScore', 10)
+                weight = criterion.get('weight', 1.0)
+                
+                # Simple fallback: use base score scaled to max_score
+                score = base_score * max_score
+                
+                criterion_scores[str(criteria_id)] = {
+                    'criteriaId': criteria_id,
+                    'criteriaName': criteria_name,
+                    'score': round(score, 2),
+                    'maxScore': max_score,
+                    'weight': weight,
+                    'comment': 'Điểm được tính tự động do lỗi AI',
+                    'suggestions': ['Vui lòng chạy lại để có đánh giá chi tiết']
+                }
+        
+        # Build basic report content
+        report_content = f"""
+BÁO CÁO ĐÁNH GIÁ BÀI THUYẾT TRÌNH
+
+Điểm tổng kết: {overall_scores.get('overallScore', 0) if overall_scores else 0:.2f}/1.0
+
+Nội dung và độ chính xác: {overall_scores.get('contentRelevance', 0) if overall_scores else 0:.2f}/1.0
+Tương đồng ngữ nghĩa: {overall_scores.get('semanticSimilarity', 0) if overall_scores else 0:.2f}/1.0
+Tương thích Slide - Audio: {overall_scores.get('slideAlignment', 0) if overall_scores else 0:.2f}/1.0
+"""
+        
+        if speech_quality:
+            report_content += f"""
+Chất lượng giọng nói:
+- Fluency: {speech_quality.get('fluencyScore', 'N/A')}
+- Clarity: {speech_quality.get('clarityScore', 'N/A')}
+- Confidence: {speech_quality.get('confidenceScore', 'N/A')}
+"""
+        
+        return {
+            'criterion_scores': criterion_scores,
+            'report_content': report_content,
+            'overall_scores': overall_scores or {}
+        }
+
 
 # ============================================================
 # Helper class for teamwork results

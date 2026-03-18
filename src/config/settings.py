@@ -24,6 +24,8 @@ class Settings:
     AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
     AWS_REGION = os.getenv('AWS_REGION')
     AWS_SQS_REPORT_QUEUE_URL = os.getenv('AWS_SQS_REPORT_QUEUE_URL')
+    # Visibility timeout (seconds) to set when processing a message (queue default may be 8s)
+    VISIBILITY_TIMEOUT_SECONDS = int(os.getenv('VISIBILITY_TIMEOUT_SECONDS') or 300)
     
     # Database Configuration (MySQL)
     DB_HOST = os.getenv('DB_HOST')
@@ -52,7 +54,11 @@ class Settings:
     
     # Logging Configuration
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-    
+
+    # API Configuration
+    API_HOST = os.getenv('API_HOST', '0.0.0.0')
+    API_PORT = int(os.getenv('API_PORT') or 8000)
+
     @classmethod
     def validate(cls):
         """Validate required settings"""

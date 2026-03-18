@@ -16,12 +16,19 @@ logger = get_logger(__name__)
 
 @dataclass
 class SQSMessage:
-    """SQS message structure"""
+    """SQS message structure - matches oratorai-report-queue payload"""
     message_id: str
     receipt_handle: str
     job_id: int
     presentation_id: int
-    metadata: Dict[str, Any]
+    report_id: int = None  # AIReport ID from Node API (optional)
+    class_id: int = None  # Class ID (optional)
+    rubric_data: list = None  # Rubric criteria from Node API (optional)
+    settings: dict = None  # AI settings (optional)
+    metadata: Dict[str, Any] = None
+    queue_type: str = None  # e.g. "report"
+    sent_at: str = None
+    version: str = None
 
 class SQSService:
     """Service for SQS operations"""
@@ -68,20 +75,43 @@ class SQSService:
             sqs_messages = []
             for msg in messages:
                 try:
-                    body = json.loads(msg['Body'])
-                    
+                    raw_body = msg['Body']
+                    body = json.loads(raw_body)
+                    # Handle SNS-wrapped message (Body may be JSON with 'Message' containing payload)
+                    if isinstance(body, dict) and 'Message' in body:
+                        body = json.loads(body['Message']) if isinstance(body['Message'], str) else body['Message']
+
+                    queue_type = body.get('queueType')
+                    if queue_type is not None and queue_type != 'report':
+                        logger.debug(f"Skipping non-report message: queueType={queue_type}")
+                        continue
+
+                    job_id = body.get('jobId')
+                    presentation_id = body.get('presentationId')
+                    if job_id is None or presentation_id is None:
+                        logger.warning(f"Missing jobId or presentationId in message: {body}")
+                        continue
+
                     sqs_message = SQSMessage(
                         message_id=msg['MessageId'],
                         receipt_handle=msg['ReceiptHandle'],
-                        job_id=body.get('jobId'),
-                        presentation_id=body.get('presentationId'),
-                        metadata=body
+                        job_id=job_id,
+                        presentation_id=presentation_id,
+                        report_id=body.get('reportId'),
+                        class_id=body.get('classId'),
+                        rubric_data=body.get('rubricData'),
+                        settings=body.get('settings'),
+                        metadata=body,
+                        queue_type=queue_type,
+                        sent_at=body.get('sentAt'),
+                        version=body.get('version')
                     )
                     sqs_messages.append(sqs_message)
-                    
-                    logger.debug(f"Received message: {sqs_message.message_id}, jobId={sqs_message.job_id}")
-                    
-                except (json.JSONDecodeError, KeyError) as e:
+                    logger.debug(
+                        f"Received report message: id={sqs_message.message_id}, jobId={sqs_message.job_id}, "
+                        f"presentationId={sqs_message.presentation_id}, reportId={sqs_message.report_id}"
+                    )
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
                     logger.warning(f"Invalid message format: {e}")
                     continue
             
@@ -90,13 +120,37 @@ class SQSService:
         except (ClientError, BotoCoreError) as e:
             raise SQSError(f"Failed to poll messages: {e}")
     
+    def change_message_visibility(self, message: SQSMessage, visibility_timeout: int) -> bool:
+        """
+        Extend visibility timeout so message is not re-delivered while processing.
+        Use this when processing takes longer than queue's default (e.g. 8 seconds).
+
+        Args:
+            message: SQSMessage object
+            visibility_timeout: Seconds the message stays hidden (e.g. 300 for 5 min)
+
+        Returns:
+            True if successful
+        """
+        try:
+            self.client.change_message_visibility(
+                QueueUrl=self.queue_url,
+                ReceiptHandle=message.receipt_handle,
+                VisibilityTimeout=visibility_timeout
+            )
+            logger.debug(f"Extended visibility for message {message.message_id} to {visibility_timeout}s")
+            return True
+        except (ClientError, BotoCoreError) as e:
+            logger.error(f"Failed to change message visibility: {e}")
+            return False
+
     def delete_message(self, message: SQSMessage) -> bool:
         """
         Delete message from queue after successful processing
-        
+
         Args:
             message: SQSMessage object
-            
+
         Returns:
             True if successful
         """
@@ -107,7 +161,7 @@ class SQSService:
             )
             logger.debug(f"Deleted message: {message.message_id}")
             return True
-            
+
         except (ClientError, BotoCoreError) as e:
             logger.error(f"Failed to delete message: {e}")
             return False
