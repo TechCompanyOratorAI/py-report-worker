@@ -84,62 +84,61 @@ class WebhookService:
         self,
         job_id: int,
         presentation_id: int,
-        segment_analyses: List[Dict[str, Any]],
-        overall_scores: Dict[str, Any],
-        metadata: Dict[str, Any]
+        report_id: int = None,
+        segment_analyses: List[Dict[str, Any]] = None,
+        overall_scores: Dict[str, Any] = None,
+        rubric_scores: Dict[str, Any] = None,
+        metadata: Dict[str, Any] = None
     ) -> bool:
         """
         Send report completion webhook
-        
+
         Args:
             job_id: Job ID
             presentation_id: Presentation ID
+            report_id: AIReport ID
             segment_analyses: List of segment analysis results
             overall_scores: Overall scores
+            rubric_scores: Rubric-based scores
             metadata: Additional metadata
-            
+
         Returns:
             True if successful
         """
         payload = {
             'jobId': job_id,
             'presentationId': presentation_id,
+            'reportId': report_id,
             'status': 'done',
-            'segmentAnalyses': segment_analyses,
-            'overallScores': overall_scores,
-            'metadata': metadata
+            'segmentAnalyses': segment_analyses or [],
+            'overallScores': overall_scores or {},
+            'rubricScores': rubric_scores or {},
+            'metadata': metadata or {}
         }
-        
+
         return self._send_webhook('/webhooks/report-complete', payload)
     
     def send_report_failed(
         self,
         job_id: int,
         presentation_id: int,
-        error_message: str,
+        report_id: int = None,
+        error_message: str = None,
         error_details: Dict[str, Any] = None
     ) -> bool:
         """
-        Send report failure webhook
-        
-        Args:
-            job_id: Job ID
-            presentation_id: Presentation ID
-            error_message: Error message
-            error_details: Additional error details
-            
-        Returns:
-            True if successful
+        Send report failure webhook.
+        Node API only has /webhooks/report-complete; it accepts status='failed' there.
         """
         payload = {
             'jobId': job_id,
             'presentationId': presentation_id,
+            'reportId': report_id,
             'status': 'failed',
             'error': error_message,
             'errorDetails': error_details or {}
         }
-        
-        return self._send_webhook('/webhooks/report-failed', payload)
+        return self._send_webhook('/webhooks/report-complete', payload)
     
     def test_connection(self) -> bool:
         """Test webhook connectivity"""

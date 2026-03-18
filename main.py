@@ -105,11 +105,19 @@ class ReportWorker:
                 time.sleep(settings.POLL_INTERVAL)
     
     def _process_message(self, message: SQSMessage):
-        """Process a single SQS message"""
+        """Process a single SQS message from oratorai-report-queue"""
         job_id = message.job_id
         presentation_id = message.presentation_id
-        
-        logger.info(f"🎯 Processing Job {job_id} - Presentation {presentation_id}")
+        report_id = message.report_id  # AIReport ID from Node API (optional)
+        class_id = message.class_id  # Class ID (optional)
+        rubric_data = message.rubric_data  # Rubric criteria (optional)
+        msg_settings = message.settings  # AI settings (optional)
+
+        # Extend visibility timeout so message is not re-delivered while we process (queue default is often 8s)
+        if settings.VISIBILITY_TIMEOUT_SECONDS > 0:
+            self.sqs_service.change_message_visibility(message, settings.VISIBILITY_TIMEOUT_SECONDS)
+
+        logger.info(f"🎯 Processing Job {job_id} - Presentation {presentation_id} - Report {report_id}")
         
         start_time = time.time()
         
@@ -117,6 +125,10 @@ class ReportWorker:
             result = self._process_report_job(
                 job_id=job_id,
                 presentation_id=presentation_id,
+                report_id=report_id,
+                class_id=class_id,
+                rubric_data=rubric_data,
+                settings=msg_settings,
                 metadata=message.metadata,
                 start_time=start_time
             )
@@ -128,8 +140,10 @@ class ReportWorker:
             self.webhook_service.send_report_complete(
                 job_id=job_id,
                 presentation_id=presentation_id,
+                report_id=report_id,
                 segment_analyses=result['segmentAnalyses'],
                 overall_scores=result['overallScores'],
+                rubric_scores=result.get('rubricScores'),
                 metadata=result['metadata']
             )
             
@@ -151,6 +165,7 @@ class ReportWorker:
                 self.webhook_service.send_report_failed(
                     job_id=job_id,
                     presentation_id=presentation_id,
+                    report_id=report_id,
                     error_message=str(e)
                 )
             except Exception as webhook_error:
@@ -163,10 +178,14 @@ class ReportWorker:
         self,
         job_id: int,
         presentation_id: int,
+        report_id: int,
+        class_id: int,
+        rubric_data: list,
+        settings: dict,
         metadata: Dict[str, Any],
         start_time: float
     ) -> Dict[str, Any]:
-        """Process report generation job"""
+        """Process report generation job with rubric-based scoring"""
         
         # Step 1: Get presentation data
         logger.info(f"📥 Loading presentation data...")
@@ -178,93 +197,154 @@ class ReportWorker:
         if not presentation_data.transcript_segments:
             raise AnalysisError("No transcript segments found")
         
-        # Step 2: Perform analysis
-        logger.info(f"🔍 Analyzing segments...")
-        segment_analyses_obj, overall_scores_obj = self.report_service.analyze_presentation(presentation_data)
-        
-        # Convert to API format
-        segment_analyses = []
-        for analysis in segment_analyses_obj:
-            segment_analyses.append({
-                'segmentId': analysis.segment_id,
-                'relevanceScore': analysis.relevance_score,
-                'semanticScore': analysis.semantic_score,
-                'alignmentScore': analysis.alignment_score,
-                'issues': analysis.issues,
-                'suggestions': analysis.suggestions,
-                'topicKeywordsFound': analysis.topic_keywords_found,
-                'bestMatchingSlide': analysis.best_matching_slide,
-                'expectedSlideNumber': analysis.expected_slide_number,
-                'timingDeviation': analysis.timing_deviation
-            })
-        
-        overall_scores = {
-            'contentRelevance': overall_scores_obj.content_relevance,
-            'semanticSimilarity': overall_scores_obj.semantic_similarity,
-            'slideAlignment': overall_scores_obj.slide_alignment,
-            'overallScore': overall_scores_obj.overall_score
-        }
+        # Step 2: Get semantic analysis results from database
+        logger.info(f"📊 Loading semantic analysis results for presentation {presentation_id}...")
+        segment_analyses_data = self.database_service.get_segment_analyses_for_feedback(presentation_id)
 
-        # Step 3: Generate AI feedback
-        logger.info(f"🤖 Generating AI feedback...")
+        segment_analyses = segment_analyses_data.get('segment_analyses', [])
+        overall_scores_db = segment_analyses_data.get('overall_scores')
+        presentation_info = segment_analyses_data.get('presentation_info')
+
+        logger.info(f"   - Presentation info: {presentation_info}")
+        logger.info(f"   - Found {len(segment_analyses)} segment analyses")
+
+        if not segment_analyses:
+            # Log more details for debugging
+            seg_count = self.database_service.get_segment_analyses_count(presentation_id)
+            logger.warning(f"   - No segment analyses found! (count from DB: {seg_count})")
+            # Check if presentation exists and has transcript segments
+            presentation_data_check = self.database_service.get_presentation_data(presentation_id)
+            if presentation_data_check:
+                logger.warning(f"   - Presentation exists, has {len(presentation_data_check.transcript_segments)} transcript segments, {len(presentation_data_check.slides)} slides")
+            else:
+                logger.warning(f"   - Presentation {presentation_id} not found in database!")
+            raise AnalysisError("No segment analyses found - semantic analysis may not be complete")
         
-        try:
-            # Use segment analyses from memory instead of reading from database
-            if segment_analyses and overall_scores:
-                feedback_result = self.report_service.generate_feedback(
+        # Step 3: Get speech quality data and analysis results
+        logger.info(f"🎤 Loading speech quality and analysis data...")
+        speech_quality = self.database_service.get_speech_quality_analysis(presentation_id)
+        hesitation_patterns = self.database_service.get_hesitation_patterns(presentation_id)
+        segment_speech_quality = self.database_service.get_segment_speech_quality(presentation_id)
+        analysis_results = self.database_service.get_analysis_results(presentation_id)
+        
+        logger.info(f"   - Speech Quality: {'Yes' if speech_quality else 'No'}")
+        logger.info(f"   - Hesitation Patterns: {len(hesitation_patterns) if hesitation_patterns else 0}")
+        logger.info(f"   - Segment Speech Quality: {len(segment_speech_quality) if segment_speech_quality else 0}")
+        logger.info(f"   - Analysis Results: {'Yes' if analysis_results else 'No'}")
+        
+        # Step 4: Use rubric data from message or fetch from database
+        if not rubric_data and class_id:
+            logger.info(f"📋 Loading rubric criteria for class {class_id}...")
+            rubric_criteria = self.database_service.get_class_rubric_criteria(class_id)
+        else:
+            rubric_criteria = rubric_data or []
+        
+        # Step 5: Calculate rubric-based scores using AI
+        logger.info(f"🤖 Calculating rubric-based scores...")
+        
+        rubric_scores = None
+        report_content = ""
+        
+        if rubric_criteria:
+            try:
+                rubric_result = self.report_service.calculate_rubric_scores(
                     presentation_title=presentation_data.title,
                     topic_name=presentation_data.topic_name,
                     topic_description=presentation_data.topic_description or "",
                     segment_analyses=segment_analyses,
-                    overall_scores=overall_scores,
+                    overall_scores=overall_scores_db,
+                    speech_quality=speech_quality,
+                    hesitation_patterns=hesitation_patterns,
+                    segment_speech_quality=segment_speech_quality,
+                    analysis_results=analysis_results,
+                    rubric_criteria=rubric_criteria,
+                    settings=settings,
                     course_name=presentation_data.course_name,
                     course_description=presentation_data.course_description,
                     topic_requirements=presentation_data.topic_requirements
                 )
                 
-                self.database_service.save_feedback(
-                    presentation_id=presentation_id,
-                    rating=feedback_result['overall_score'],
-                    comments=feedback_result['comments'],
-                    feedback_type=feedback_result.get('feedback_type', 'ai_report'),
-                    reviewer_id=None,
-                    is_visible_to_student=True
-                )
-        except Exception as e:
-            logger.error(f"   - Failed to generate feedback: {e}")
-        
-        # Step 4: Generate Teamwork Analysis feedback
-        logger.info(f"👥 Analyzing teamwork...")
-        
-        try:
-            transcript_data = self.database_service.get_transcript_with_speakers(presentation_id)
-            
-            if transcript_data["segments"] and len(transcript_data["speakers"]) >= 2:
-                teamwork_result = self.report_service.analyze_teamwork(transcript_data)
+                rubric_scores = rubric_result.get('criterion_scores', {})
+                report_content = rubric_result.get('report_content', '')
+                overall_scores = rubric_result.get('overall_scores', overall_scores_db)
                 
-                # Save teamwork feedback
-                self.database_service.save_feedback(
+                logger.info(f"✅ Rubric-based scoring complete")
+                
+            except Exception as e:
+                logger.error(f"   - Rubric scoring failed: {e}, using fallback")
+                rubric_scores = {}
+                report_content = ""
+                overall_scores = overall_scores_db
+        else:
+            logger.warning(f"   - No rubric criteria found, using basic scoring")
+            overall_scores = overall_scores_db
+
+        # Log report completion summary
+        overall_score_value = overall_scores.get('overallScore', 0) if overall_scores else 0
+        logger.info(f"📊 Report completed - Overall Score: {overall_score_value:.2f}/1.00")
+        if rubric_scores:
+            logger.info(f"   - Rubric Scores: {list(rubric_scores.keys())}")
+
+        # Log report content
+        if report_content:
+            logger.info(f"📝 Report Content:\n{report_content}")
+        else:
+            logger.info(f"   - Report Content: (empty)")
+
+        # Convert segment analyses to API format
+        segment_analyses_api = []
+        for analysis in segment_analyses:
+            segment_analyses_api.append({
+                'segmentId': analysis.get('segmentId'),
+                'relevanceScore': analysis.get('relevanceScore'),
+                'semanticScore': analysis.get('semanticScore'),
+                'alignmentScore': analysis.get('alignmentScore'),
+                'issues': analysis.get('issues'),
+                'suggestions': analysis.get('suggestions'),
+                'topicKeywordsFound': analysis.get('topicKeywordsFound'),
+                'bestMatchingSlide': analysis.get('bestMatchingSlide'),
+                'expectedSlideNumber': analysis.get('expectedSlideNumber'),
+                'timingDeviation': analysis.get('timingDeviation')
+            })
+        
+        # Step 6: Save AIReport to database
+        if report_id:
+            try:
+                overall_score_value = overall_scores.get('overallScore', 0) if overall_scores else 0
+                
+                self.database_service.save_ai_report(
                     presentation_id=presentation_id,
-                    rating=teamwork_result.overall_teamwork_score,
-                    comments=teamwork_result.feedback,
-                    feedback_type='teamwork',  # Different feedback type
-                    reviewer_id=None,
-                    is_visible_to_student=True
+                    report_id=report_id,
+                    overall_score=overall_score_value,
+                    criterion_scores=rubric_scores,
+                    report_content=report_content,
+                    report_status="completed",
+                    generated_by_model=self.report_service.model_name if hasattr(self.report_service, 'model_name') else "report-worker-v1"
                 )
                 
-                logger.info(f"   ✅ Teamwork analysis saved: score={teamwork_result.overall_teamwork_score:.2f}")
-            else:
-                logger.info(f"   - Skipped teamwork analysis: not enough speakers ({len(transcript_data['speakers'])})")
-        except Exception as e:
-            logger.error(f"   - Failed to analyze teamwork: {e}")
-        
+                logger.info(f"✅ AIReport saved: reportId={report_id}")
+            except Exception as e:
+                logger.error(f"   - Failed to save AIReport: {e}")
+
+        # Final report completion log
+        logger.info(f"🎉 REPORT COMPLETED SUCCESSFULLY")
+        logger.info(f"   📋 Presentation ID: {presentation_id}")
+        logger.info(f"   📝 Job ID: {job_id}")
+        logger.info(f"   📊 Report ID: {report_id}")
+        logger.info(f"   ⭐ Overall Score: {overall_scores.get('overallScore', 0):.2f}/1.00")
+        logger.info(f"   📄 Segments Analyzed: {len(segment_analyses)}")
+        logger.info(f"   🖼️  Slides: {len(presentation_data.slides)}")
+
         return {
-            'segmentAnalyses': segment_analyses,
-            'overallScores': overall_scores,
+            'segmentAnalyses': segment_analyses_api,
+            'overallScores': overall_scores or {},
+            'rubricScores': rubric_scores,
             'metadata': {
                 'totalSegments': len(segment_analyses),
                 'totalSlides': len(presentation_data.slides),
-                'jobId': job_id
+                'jobId': job_id,
+                'reportId': report_id,
+                'classId': class_id
             }
         }
     

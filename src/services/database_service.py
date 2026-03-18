@@ -338,19 +338,20 @@ class DatabaseService:
     
     def get_analysis_results(self, presentation_id: int) -> Optional[Dict[str, Any]]:
         """
-        Get overall analysis results for a presentation
+        Get overall analysis results for a presentation including all related quality metrics
         
         Args:
             presentation_id: Presentation ID
             
         Returns:
-            Dict with analysis results or None if not found
+            Dict with analysis results and related quality metrics or None if not found
         """
         self._ensure_connection()
         
         try:
             cursor = self.connection.cursor(dictionary=True)
             
+            # Get AnalysisResults
             cursor.execute("""
                 SELECT 
                     resultId,
@@ -358,13 +359,64 @@ class DatabaseService:
                     overallScore,
                     analyzedAt,
                     processingTimeSeconds,
+                    aiModelVersion,
                     status
                 FROM AnalysisResults 
                 WHERE presentationId = %s
             """, (presentation_id,))
             
             result = cursor.fetchone()
+            
+            if not result:
+                cursor.close()
+                return None
+            
+            result_id = result.get('resultId')
+            
+            # Get ContentQuality
+            cursor.execute("""
+                SELECT coherenceScore, depthScore, accuracyScore, topicCoverageScore, strengths, weaknesses
+                FROM ContentQuality WHERE resultId = %s
+            """, (result_id,))
+            content_quality = cursor.fetchone()
+            
+            # Get DeliveryQuality
+            cursor.execute("""
+                SELECT clarityScore, pronunciationScore, volumeConsistency, speechRateWpm, voiceQuality
+                FROM DeliveryQuality WHERE resultId = %s
+            """, (result_id,))
+            delivery_quality = cursor.fetchone()
+            
+            # Get StructureQuality
+            cursor.execute("""
+                SELECT organizationScore, transitionQuality, introConclusionScore, logicalFlowScore, structureNotes
+                FROM StructureQuality WHERE resultId = %s
+            """, (result_id,))
+            structure_quality = cursor.fetchone()
+            
+            # Get EngagementMetric
+            cursor.execute("""
+                SELECT enthusiasmScore, variationScore, rhetoricalDeviceCount, emotionalTone
+                FROM EngagementMetrics WHERE resultId = %s
+            """, (result_id,))
+            engagement_metric = cursor.fetchone()
+            
+            # Get SpeechPattern
+            cursor.execute("""
+                SELECT fillerWordCount, avgPauseDuration, longPauseCount, paceConsistency, fillerWordList
+                FROM SpeechPatterns WHERE resultId = %s
+            """, (result_id,))
+            speech_pattern = cursor.fetchone()
+            
             cursor.close()
+            
+            # Combine all data
+            result['contentQuality'] = content_quality
+            result['deliveryQuality'] = delivery_quality
+            result['structureQuality'] = structure_quality
+            result['engagementMetric'] = engagement_metric
+            result['speechPattern'] = speech_pattern
+            
             return result
             
         except MySQLError as e:
@@ -661,6 +713,291 @@ class DatabaseService:
         if self.connection and self.connection.is_connected():
             self.connection.close()
             logger.info("Database connection closed")
+
+    # ============================================================
+    # RUBRIC DATA METHODS
+    # ============================================================
+
+    def get_class_rubric_criteria(self, class_id: int) -> List[Dict[str, Any]]:
+        """
+        Get active rubric criteria for a class
+
+        Args:
+            class_id: Class ID
+
+        Returns:
+            List of rubric criteria
+        """
+        self._ensure_connection()
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+
+            cursor.execute("""
+                SELECT
+                    classRubricCriteriaId,
+                    classId,
+                    rubricTemplateId,
+                    criteriaName,
+                    criteriaDescription,
+                    weight,
+                    maxScore,
+                    displayOrder,
+                    evaluationGuide
+                FROM ClassRubricCriteria
+                WHERE classId = %s AND isActive = 1
+                ORDER BY displayOrder ASC
+            """, (class_id,))
+
+            criteria = cursor.fetchall()
+            cursor.close()
+
+            logger.debug(f"Retrieved {len(criteria)} rubric criteria for class {class_id}")
+            return criteria
+
+        except MySQLError as e:
+            raise DatabaseError(f"Failed to get rubric criteria: {e}")
+
+    # ============================================================
+    # SPEECH QUALITY DATA METHODS
+    # ============================================================
+
+    def get_speech_quality_analysis(self, presentation_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get speech quality analysis for a presentation
+
+        Args:
+            presentation_id: Presentation ID
+
+        Returns:
+            Dict with speech quality data or None
+        """
+        self._ensure_connection()
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+
+            cursor.execute("""
+                SELECT
+                    id as analysisId,
+                    presentationId,
+                    jobId,
+                    fluencyScore,
+                    clarityScore,
+                    confidenceScore,
+                    overallScore,
+                    totalHesitationCount,
+                    totalHesitationTime,
+                    hesitationRate,
+                    createdAt
+                FROM SpeechQualityAnalyses
+                WHERE presentationId = %s
+                ORDER BY createdAt DESC
+                LIMIT 1
+            """, (presentation_id,))
+
+            result = cursor.fetchone()
+            cursor.close()
+
+            return result
+
+        except MySQLError as e:
+            logger.warning(f"Failed to get speech quality analysis: {e}")
+            return None
+
+    def get_hesitation_patterns(self, presentation_id: int) -> List[Dict[str, Any]]:
+        """
+        Get hesitation patterns for a presentation
+
+        Args:
+            presentation_id: Presentation ID
+
+        Returns:
+            List of hesitation patterns
+        """
+        self._ensure_connection()
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+
+            cursor.execute("""
+                SELECT
+                    hp.id as patternId,
+                    hp.speechAnalysisId,
+                    hp.segmentId,
+                    hp.startTime,
+                    hp.endTime,
+                    hp.duration,
+                    hp.patternType,
+                    hp.confidence
+                FROM HesitationPatterns hp
+                JOIN SpeechQualityAnalyses sq ON hp.speechAnalysisId = sq.id
+                WHERE sq.presentationId = %s
+                ORDER BY hp.startTime ASC
+            """, (presentation_id,))
+
+            patterns = cursor.fetchall()
+            cursor.close()
+
+            return patterns
+
+        except MySQLError as e:
+            logger.warning(f"Failed to get hesitation patterns: {e}")
+            return []
+
+    def get_segment_speech_quality(self, presentation_id: int) -> List[Dict[str, Any]]:
+        """
+        Get speech quality for each segment
+
+        Args:
+            presentation_id: Presentation ID
+
+        Returns:
+            List of segment speech quality data
+        """
+        self._ensure_connection()
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+
+            cursor.execute("""
+                SELECT
+                    ssa.id as segmentSpeechQualityId,
+                    ssa.segmentId,
+                    ssa.segmentFluency as fluencyScore,
+                    ssa.segmentClarity as clarityScore,
+                    ssa.segmentConfidence as confidenceScore,
+                    ssa.segmentHesitationCount as hesitationCount,
+                    ssa.segmentSpeakingRate as speakingRate,
+                    ssa.segmentStartTime as startTimestamp,
+                    ssa.segmentEndTime as endTimestamp
+                FROM SegmentSpeechQuality ssa
+                JOIN SpeechQualityAnalyses sq ON ssa.speechAnalysisId = sq.id
+                JOIN TranscriptSegments ts ON ssa.segmentId = ts.segmentId
+                JOIN Transcripts t ON ts.transcriptId = t.transcriptId
+                WHERE t.presentationId = %s
+                ORDER BY ts.segmentNumber ASC
+            """, (presentation_id,))
+
+            results = cursor.fetchall()
+            cursor.close()
+
+            return results
+
+        except MySQLError as e:
+            logger.warning(f"Failed to get segment speech quality: {e}")
+            return []
+
+    # ============================================================
+    # AI REPORT METHODS
+    # ============================================================
+
+    def save_ai_report(
+        self,
+        presentation_id: int,
+        report_id: int,
+        overall_score: float,
+        criterion_scores: Dict[str, Any],
+        report_content: str,
+        report_status: str = "completed",
+        generated_by_model: str = "report-worker-v1"
+    ) -> bool:
+        """
+        Save AI report to database
+
+        Args:
+            presentation_id: Presentation ID
+            report_id: Report ID from AIReports table
+            overall_score: Overall score (0-1)
+            criterion_scores: Scores for each criterion (JSON)
+            report_content: Generated report content
+            report_status: Report status
+            generated_by_model: AI model used
+
+        Returns:
+            True if successful
+        """
+        self._ensure_connection()
+
+        try:
+            cursor = self.connection.cursor()
+
+            cursor.execute("""
+                UPDATE AIReports SET
+                    overallScore = %s,
+                    criterionScores = %s,
+                    reportContent = %s,
+                    reportStatus = %s,
+                    generatedByModel = %s,
+                    generatedAt = %s
+                WHERE reportId = %s
+            """, (
+                overall_score,
+                json.dumps(criterion_scores, ensure_ascii=False),
+                report_content,
+                report_status,
+                generated_by_model,
+                datetime.now(),
+                report_id
+            ))
+
+            cursor.close()
+            logger.info(f"Updated AIReport {report_id} for presentation {presentation_id}")
+            return True
+
+        except MySQLError as e:
+            raise DatabaseError(f"Failed to save AI report: {e}")
+
+    def get_ai_report(self, presentation_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get AI report data by presentation ID (submission)
+
+        Args:
+            presentation_id: Presentation/Submission ID
+
+        Returns:
+            Dict with AI report data or None if not found
+        """
+        self._ensure_connection()
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+
+            # Get AIReport by presentationId
+            cursor.execute("""
+                SELECT
+                    reportId,
+                    presentationId,
+                    overallScore,
+                    criterionScores,
+                    reportContent,
+                    reportStatus,
+                    generatedByModel,
+                    generatedAt
+                FROM AIReports
+                WHERE presentationId = %s
+                ORDER BY generatedAt DESC
+                LIMIT 1
+            """, (presentation_id,))
+
+            result = cursor.fetchone()
+            cursor.close()
+
+            if not result:
+                logger.debug(f"No AIReport found for presentationId={presentation_id}")
+                return None
+
+            # Parse JSON fields
+            if result.get('criterionScores'):
+                try:
+                    result['criterionScores'] = json.loads(result['criterionScores'])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            return result
+
+        except MySQLError as e:
+            raise DatabaseError(f"Failed to get AI report: {e}")
 
 
 # Singleton instance
