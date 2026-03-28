@@ -27,6 +27,7 @@ class PresentationData:
     transcript_segments: List[Dict[str, Any]]
     slides: List[Dict[str, Any]]
     job_id: Optional[int] = None
+    class_id: Optional[int] = None
     course_id: Optional[int] = None
     course_name: Optional[str] = None
     course_description: Optional[str] = None
@@ -115,6 +116,7 @@ class DatabaseService:
                     p.title,
                     p.description,
                     p.topicId,
+                    p.classId,
                     t.topicName,
                     t.description as topicDescription,
                     t.requirements as topicRequirements,
@@ -185,6 +187,7 @@ class DatabaseService:
                 topic_name=presentation_row['topicName'],
                 topic_description=presentation_row['topicDescription'],
                 topic_requirements=presentation_row.get('topicRequirements'),
+                class_id=presentation_row.get('classId'),
                 course_id=presentation_row.get('courseId'),
                 course_name=presentation_row.get('courseName'),
                 course_description=presentation_row.get('courseDescription'),
@@ -963,11 +966,12 @@ class DatabaseService:
         try:
             cursor = self.connection.cursor(dictionary=True)
 
-            # Get AIReport by presentationId
+            # Get AIReport by presentationId (presentation)
             cursor.execute("""
                 SELECT
                     reportId,
                     presentationId,
+                    classId,
                     overallScore,
                     criterionScores,
                     reportContent,
@@ -998,6 +1002,80 @@ class DatabaseService:
 
         except MySQLError as e:
             raise DatabaseError(f"Failed to get AI report: {e}")
+
+    def get_report_id_by_submission(self, submission_id: int) -> Optional[int]:
+        """
+        Find reportId from AIReports by presentationId (presentation ID).
+        AIReports has unique constraint on presentationId, so at most one record exists.
+
+        Args:
+            submission_id: Presentation/Submission ID
+
+        Returns:
+            reportId if found, None otherwise
+        """
+        self._ensure_connection()
+
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT reportId FROM AIReports
+                WHERE presentationId = %s
+                LIMIT 1
+            """, (submission_id,))
+            result = cursor.fetchone()
+            cursor.close()
+
+            if result:
+                logger.debug(f"Found reportId={result['reportId']} for presentationId={submission_id}")
+                return result['reportId']
+
+            logger.debug(f"No AIReport found for presentationId={submission_id}")
+            return None
+
+        except MySQLError as e:
+            raise DatabaseError(f"Failed to get reportId: {e}")
+
+    def ensure_ai_report_record(self, submission_id: int, class_id: int) -> int:
+        """
+        Ensure an AIReports record exists for the given submission.
+        If no record exists, INSERT one. Returns the reportId.
+
+        Args:
+            submission_id: Presentation/Submission ID
+            class_id: Class ID
+
+        Returns:
+            reportId of existing or newly created record
+        """
+        # Try to find existing record first
+        existing = self.get_report_id_by_submission(submission_id)
+        if existing:
+            logger.debug(f"AIReports record already exists: reportId={existing}")
+            return existing
+
+        # Insert new record
+        self._ensure_connection()
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute("""
+                INSERT INTO AIReports (presentationId, classId, reportStatus, createdAt, updatedAt)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (
+                submission_id,
+                class_id,
+                "pending",
+                datetime.now(),
+                datetime.now()
+            ))
+            new_id = cursor.lastrowid
+            self.connection.commit()
+            cursor.close()
+            logger.info(f"Created new AIReports record: reportId={new_id}, presentationId={submission_id}")
+            return new_id
+
+        except MySQLError as e:
+            raise DatabaseError(f"Failed to create AIReports record: {e}")
 
 
 # Singleton instance

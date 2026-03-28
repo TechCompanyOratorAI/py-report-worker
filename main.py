@@ -140,7 +140,7 @@ class ReportWorker:
             self.webhook_service.send_report_complete(
                 job_id=job_id,
                 presentation_id=presentation_id,
-                report_id=report_id,
+                report_id=result['metadata']['reportId'],
                 segment_analyses=result['segmentAnalyses'],
                 overall_scores=result['overallScores'],
                 rubric_scores=result.get('rubricScores'),
@@ -165,7 +165,7 @@ class ReportWorker:
                 self.webhook_service.send_report_failed(
                     job_id=job_id,
                     presentation_id=presentation_id,
-                    report_id=report_id,
+                    report_id=result['metadata']['reportId'] if result and 'metadata' in result else report_id,
                     error_message=str(e)
                 )
             except Exception as webhook_error:
@@ -190,12 +190,30 @@ class ReportWorker:
         # Step 1: Get presentation data
         logger.info(f"📥 Loading presentation data...")
         presentation_data = self.database_service.get_presentation_data(presentation_id)
-        
+
         if not presentation_data:
             raise DatabaseError(f"Presentation {presentation_id} not found")
-        
+
         if not presentation_data.transcript_segments:
             raise AnalysisError("No transcript segments found")
+
+        # 流水线 REPORT job 的 SQS 往往不含 classId；用演示所属班级补全以便查询 ClassRubricCriteria
+        effective_class_id = class_id if class_id is not None else presentation_data.class_id
+
+        # Pipeline REPORT job SQS messages may not include reportId;
+        # use ensure_ai_report_record to INSERT if missing, UPDATE if exists.
+        effective_report_id = report_id
+        if effective_report_id is None:
+            effective_report_id = self.database_service.get_report_id_by_submission(presentation_id)
+            if not effective_report_id:
+                logger.warning(f"   ↳ No AIReport record for presentationId={presentation_id} — creating one now...")
+                effective_report_id = self.database_service.ensure_ai_report_record(
+                    submission_id=presentation_id,
+                    class_id=effective_class_id
+                )
+                logger.info(f"   ↳ Created AIReports reportId={effective_report_id}")
+            else:
+                logger.info(f"   ↳ Found reportId={effective_report_id} from DB (presentationId={presentation_id})")
         
         # Step 2: Get semantic analysis results from database
         logger.info(f"📊 Loading semantic analysis results for presentation {presentation_id}...")
@@ -233,9 +251,9 @@ class ReportWorker:
         logger.info(f"   - Analysis Results: {'Yes' if analysis_results else 'No'}")
         
         # Step 4: Use rubric data from message or fetch from database
-        if not rubric_data and class_id:
-            logger.info(f"📋 Loading rubric criteria for class {class_id}...")
-            rubric_criteria = self.database_service.get_class_rubric_criteria(class_id)
+        if not rubric_data and effective_class_id:
+            logger.info(f"📋 Loading rubric criteria for class {effective_class_id}...")
+            rubric_criteria = self.database_service.get_class_rubric_criteria(effective_class_id)
         else:
             rubric_criteria = rubric_data or []
         
@@ -308,21 +326,21 @@ class ReportWorker:
             })
         
         # Step 6: Save AIReport to database
-        if report_id:
+        if effective_report_id:
             try:
                 overall_score_value = overall_scores.get('overallScore', 0) if overall_scores else 0
-                
+
                 self.database_service.save_ai_report(
                     presentation_id=presentation_id,
-                    report_id=report_id,
+                    report_id=effective_report_id,
                     overall_score=overall_score_value,
                     criterion_scores=rubric_scores,
                     report_content=report_content,
                     report_status="completed",
                     generated_by_model=self.report_service.model_name if hasattr(self.report_service, 'model_name') else "report-worker-v1"
                 )
-                
-                logger.info(f"✅ AIReport saved: reportId={report_id}")
+
+                logger.info(f"✅ AIReport saved: reportId={effective_report_id}")
             except Exception as e:
                 logger.error(f"   - Failed to save AIReport: {e}")
 
@@ -330,7 +348,7 @@ class ReportWorker:
         logger.info(f"🎉 REPORT COMPLETED SUCCESSFULLY")
         logger.info(f"   📋 Presentation ID: {presentation_id}")
         logger.info(f"   📝 Job ID: {job_id}")
-        logger.info(f"   📊 Report ID: {report_id}")
+        logger.info(f"   📊 Report ID: {effective_report_id}")
         logger.info(f"   ⭐ Overall Score: {overall_scores.get('overallScore', 0):.2f}/1.00")
         logger.info(f"   📄 Segments Analyzed: {len(segment_analyses)}")
         logger.info(f"   🖼️  Slides: {len(presentation_data.slides)}")
@@ -343,8 +361,8 @@ class ReportWorker:
                 'totalSegments': len(segment_analyses),
                 'totalSlides': len(presentation_data.slides),
                 'jobId': job_id,
-                'reportId': report_id,
-                'classId': class_id
+                'reportId': effective_report_id,
+                'classId': effective_class_id
             }
         }
     
