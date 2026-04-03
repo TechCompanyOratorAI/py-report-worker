@@ -755,6 +755,10 @@ class DatabaseService:
             criteria = cursor.fetchall()
             cursor.close()
 
+            for row in criteria or []:
+                if row.get("criteriaId") is None and row.get("classRubricCriteriaId") is not None:
+                    row["criteriaId"] = row["classRubricCriteriaId"]
+
             logger.debug(f"Retrieved {len(criteria)} rubric criteria for class {class_id}")
             return criteria
 
@@ -903,7 +907,8 @@ class DatabaseService:
         criterion_scores: Dict[str, Any],
         report_content: str,
         report_status: str = "completed",
-        generated_by_model: str = "report-worker-v1"
+        generated_by_model: str = "report-worker-v1",
+        report_body: Dict[str, Any] = None
     ) -> bool:
         """
         Save AI report to database
@@ -916,6 +921,7 @@ class DatabaseService:
             report_content: Generated report content
             report_status: Report status
             generated_by_model: AI model used
+            report_body: Structured report body (summary, strengths, weaknesses, suggestions)
 
         Returns:
             True if successful
@@ -925,24 +931,50 @@ class DatabaseService:
         try:
             cursor = self.connection.cursor()
 
-            cursor.execute("""
-                UPDATE AIReports SET
-                    overallScore = %s,
-                    criterionScores = %s,
-                    reportContent = %s,
-                    reportStatus = %s,
-                    generatedByModel = %s,
-                    generatedAt = %s
-                WHERE reportId = %s
-            """, (
-                overall_score,
-                json.dumps(criterion_scores, ensure_ascii=False),
-                report_content,
-                report_status,
-                generated_by_model,
-                datetime.now(),
-                report_id
-            ))
+            # Check if reportBody column exists
+            cursor.execute("SHOW COLUMNS FROM AIReports LIKE 'reportBody'")
+            has_report_body_col = cursor.fetchone() is not None
+
+            if has_report_body_col and report_body:
+                cursor.execute("""
+                    UPDATE AIReports SET
+                        overallScore = %s,
+                        criterionScores = %s,
+                        reportContent = %s,
+                        reportStatus = %s,
+                        generatedByModel = %s,
+                        generatedAt = %s,
+                        reportBody = %s
+                    WHERE reportId = %s
+                """, (
+                    overall_score,
+                    json.dumps(criterion_scores, ensure_ascii=False),
+                    report_content,
+                    report_status,
+                    generated_by_model,
+                    datetime.now(),
+                    json.dumps(report_body, ensure_ascii=False),
+                    report_id
+                ))
+            else:
+                cursor.execute("""
+                    UPDATE AIReports SET
+                        overallScore = %s,
+                        criterionScores = %s,
+                        reportContent = %s,
+                        reportStatus = %s,
+                        generatedByModel = %s,
+                        generatedAt = %s
+                    WHERE reportId = %s
+                """, (
+                    overall_score,
+                    json.dumps(criterion_scores, ensure_ascii=False),
+                    report_content,
+                    report_status,
+                    generated_by_model,
+                    datetime.now(),
+                    report_id
+                ))
 
             cursor.close()
             logger.info(f"Updated AIReport {report_id} for presentation {presentation_id}")
@@ -1036,6 +1068,61 @@ class DatabaseService:
         except MySQLError as e:
             raise DatabaseError(f"Failed to get reportId: {e}")
 
+    def get_active_class_ai_setting_fk(self, class_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Load active ClassAISettings row for a class (FK fields for AIReports).
+
+        Returns:
+            dict with classAiSettingId, or None if not found
+        """
+        if not class_id:
+            return None
+        self._ensure_connection()
+        try:
+            cursor = self.connection.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT classAiSettingId
+                FROM ClassAISettings
+                WHERE classId = %s AND isActive = 1
+                LIMIT 1
+                """,
+                (class_id,),
+            )
+            row = cursor.fetchone()
+            cursor.close()
+            return row
+        except MySQLError as e:
+            logger.warning("Failed to load ClassAISettings for class_id=%s: %s", class_id, e)
+            return None
+
+    def backfill_ai_report_class_setting_fks(self, report_id: int, class_id: int) -> None:
+        """
+        If AIReports row was created without ClassAISettings FKs, fill them from the active setting.
+        Only updates columns that are currently NULL (does not overwrite Node-populated values).
+        """
+        fk = self.get_active_class_ai_setting_fk(class_id)
+        if not fk or not report_id:
+            return
+        self._ensure_connection()
+        try:
+            cursor = self.connection.cursor()
+            cursor.execute(
+                """
+                UPDATE AIReports SET
+                    classAiSettingId = COALESCE(classAiSettingId, %s)
+                WHERE reportId = %s
+                """,
+                (
+                    fk.get("classAiSettingId"),
+                    report_id,
+                ),
+            )
+            self.connection.commit()
+            cursor.close()
+        except MySQLError as e:
+            logger.warning("Failed to backfill AIReports FKs for reportId=%s: %s", report_id, e)
+
     def ensure_ai_report_record(self, submission_id: int, class_id: int) -> int:
         """
         Ensure an AIReports record exists for the given submission.
@@ -1054,20 +1141,28 @@ class DatabaseService:
             logger.debug(f"AIReports record already exists: reportId={existing}")
             return existing
 
-        # Insert new record
+        # Insert new record (align with Node API: link ClassAISettings when available)
+        fk = self.get_active_class_ai_setting_fk(class_id) if class_id else None
         self._ensure_connection()
         try:
             cursor = self.connection.cursor()
-            cursor.execute("""
-                INSERT INTO AIReports (presentationId, classId, reportStatus, createdAt, updatedAt)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (
-                submission_id,
-                class_id,
-                "pending",
-                datetime.now(),
-                datetime.now()
-            ))
+            cursor.execute(
+                """
+                INSERT INTO AIReports (
+                    presentationId, classId, classAiSettingId,
+                    reportStatus, createdAt, updatedAt
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    submission_id,
+                    class_id,
+                    fk.get("classAiSettingId") if fk else None,
+                    "pending",
+                    datetime.now(),
+                    datetime.now(),
+                ),
+            )
             new_id = cursor.lastrowid
             self.connection.commit()
             cursor.close()
