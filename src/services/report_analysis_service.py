@@ -959,6 +959,92 @@ Return ONLY the JSON object. No markdown, no explanation."""
     # RUBRIC-BASED SCORING METHODS
     # ============================================================
 
+    @staticmethod
+    def _rubric_row_id(criterion: Dict) -> Any:
+        cid = criterion.get("criteriaId")
+        if cid is not None:
+            return cid
+        return criterion.get("classRubricCriteriaId")
+
+    @staticmethod
+    def _heuristic_score_factor(
+        criteria_name: str,
+        overall_scores: Dict,
+        speech_quality: Dict = None,
+    ) -> float:
+        """Map criterion name to a 0–1 factor from existing analysis signals."""
+        overall_scores = overall_scores or {}
+        n = (criteria_name or "").lower()
+        slide_keys = ("slide", "slides", "powerpoint", "trang chiếu")
+        voice_keys = ("voice", "speech", "giọng", "âm thanh", "fluency", "delivery", "oral")
+        if any(k in n for k in slide_keys):
+            return float(overall_scores.get("slideAlignment") or overall_scores.get("overallScore") or 0)
+        if any(k in n for k in voice_keys):
+            if speech_quality and speech_quality.get("overallScore") is not None:
+                ov = float(speech_quality["overallScore"])
+                return (ov / 100.0) if ov > 1.0 else ov
+            return float(overall_scores.get("overallScore") or 0)
+        rel = float(overall_scores.get("contentRelevance") or 0)
+        sem = float(overall_scores.get("semanticSimilarity") or 0)
+        if rel or sem:
+            return (rel * 0.5 + sem * 0.5)
+        return float(overall_scores.get("overallScore") or 0)
+
+    def _fill_missing_rubric_criteria(
+        self,
+        rubric_criteria: List[Dict],
+        scores_dict: Dict[str, Any],
+        overall_scores: Dict,
+        speech_quality: Dict = None,
+    ) -> Dict[str, Any]:
+        """Ensure every class rubric row has an entry (AI often returns only one criterion)."""
+        for criterion in rubric_criteria or []:
+            raw_id = self._rubric_row_id(criterion)
+            if raw_id is None:
+                continue
+            key = str(raw_id)
+            if key in scores_dict and scores_dict[key]:
+                continue
+            name = criterion.get("criteriaName", criterion.get("criteria_name", ""))
+            max_score = float(criterion.get("maxScore") or 100)
+            weight = float(criterion.get("weight") or 0)
+            factor = self._heuristic_score_factor(name, overall_scores, speech_quality)
+            score = round(factor * max_score, 2)
+            try:
+                cid_val = int(raw_id)
+            except (TypeError, ValueError):
+                cid_val = raw_id
+            scores_dict[key] = {
+                "criteriaId": cid_val,
+                "criteriaName": name,
+                "score": score,
+                "maxScore": max_score,
+                "weight": weight,
+                "comment": (
+                    "Điểm và nhận xét bổ sung tự động theo dữ liệu phân tích (semantic / slide / speech) "
+                    "vì phản hồi AI không trả đủ tiêu chí. Nên xem lại bản đánh giá chi tiết sau khi chạy lại."
+                ),
+                "suggestions": [
+                    "Chạy tạo lại báo cáo nếu cần nhận xét sâu hơn cho tiêu chí này.",
+                    "Đối chiếu rubric lớp (ClassRubricCriteria) với nội dung bài trình bày.",
+                ],
+            }
+            logger.warning(f"   ↳ Filled missing rubric criterion id={key} ({name}) with heuristic score")
+        return scores_dict
+
+    @staticmethod
+    def _weighted_overall_from_criteria(scores_dict: Dict[str, Any]) -> float:
+        """Overall 0–1 from weighted criterion scores (weights assumed to sum ~100)."""
+        total = 0.0
+        for cs in (scores_dict or {}).values():
+            w = float(cs.get("weight") or 0)
+            max_v = float(cs.get("maxScore") or 100)
+            sc = float(cs.get("score") or 0)
+            if max_v <= 0:
+                continue
+            total += (w / 100.0) * (sc / max_v)
+        return min(1.0, max(0.0, total))
+
     def calculate_rubric_scores(
         self,
         presentation_title: str,
@@ -999,7 +1085,20 @@ Return ONLY the JSON object. No markdown, no explanation."""
             Dict with criterion_scores, report_content, overall_scores
         """
         logger.info(f"🎯 Calculating rubric-based scores with {self.ai_provider.upper()} AI...")
-        
+
+        if rubric_criteria:
+            for criterion in rubric_criteria:
+                if criterion.get("criteriaId") is None and criterion.get("classRubricCriteriaId") is not None:
+                    criterion["criteriaId"] = criterion["classRubricCriteriaId"]
+
+        expected_ids = [
+            str(self._rubric_row_id(c))
+            for c in (rubric_criteria or [])
+            if self._rubric_row_id(c) is not None
+        ]
+        rubric_count = len(expected_ids)
+        ids_line = ", ".join(expected_ids) if expected_ids else "(không có)"
+
         # Prepare rubric data for prompt
         rubric_text = ""
         if rubric_criteria:
@@ -1009,9 +1108,11 @@ Return ONLY the JSON object. No markdown, no explanation."""
                 weight = criterion.get('weight', 1.0)
                 max_score = criterion.get('maxScore', 10)
                 eval_guide = criterion.get('evaluationGuide', criterion.get('evaluation_guide', ''))
-                
+                row_id = self._rubric_row_id(criterion)
+
                 rubric_text += f"""
-{idx}. {criteria_name} (Trọng số: {weight}, Điểm tối đa: {max_score})
+{idx}. criteriaId (bắt buộc giữ nguyên số này trong JSON): {row_id}
+   - Tên: {criteria_name} (Trọng số: {weight}, Điểm tối đa: {max_score})
    - Mô tả: {criteria_desc}
    - Hướng dẫn đánh giá: {eval_guide}
 """
@@ -1099,12 +1200,17 @@ Return ONLY the JSON object. No markdown, no explanation."""
 ## Rubric Criteria (Tiêu chí đánh giá):
 {rubric_text if rubric_text else "Không có rubric criteria"}
 
+## Ràng buộc bắt buộc (vi phạm là sai):
+- Danh sách đúng {rubric_count} tiêu chí; criteriaId trong JSON chỉ được là: [{ids_line}]
+- Mảng criterion_scores phải có đúng {rubric_count} phần tử (mỗi criteriaId xuất hiện đúng một lần)
+- Không gộp nhiều tiêu chí vào một phần tử; không bỏ sót Slide Quality / Voice Quality nếu rubric có các tên tương ứng
+
 ## Yêu cầu:
 1. Đánh giá từng tiêu chí trong rubric dựa trên dữ liệu phân tích
 2. Tính điểm cho mỗi tiêu chí (theo thang điểm tối đa của tiêu chí đó)
-3. Tính điểm tổng kết theo trọng số
-4. Viết nhận xét chi tiết cho từng tiêu chí
-5. Đưa ra gợi ý cải thiện
+3. Tính điểm tổng kết theo trọng số (overallScore thang 0–1)
+4. Viết nhận xét chi tiết cho từng tiêu chí (trong từng phần tử criterion_scores và trong reportContent)
+5. Đưa ra gợi ý cải thiện cho từng tiêu chí
 
 ## Trả về JSON với format sau (KHÔNG có markdown, KHÔNG có giải thích):
 {{
@@ -1120,13 +1226,26 @@ Return ONLY the JSON object. No markdown, no explanation."""
     }}
   ],
   "overallScore": <điểm tổng (0-1)>,
-  "reportContent": "<nội dung báo cáo bằng tiếng Việt, khoảng 800-1500 từ, bao gồm: tổng quan, điểm mạnh, điểm cần cải thiện, gợi ý cụ thể>"
+  "reportBody": {{
+    "summary": "<đoạn tổng quan ngắn gọn bài thuyết trình, 100-200 từ, tiếng Việt>",
+    "strengths": ["<điểm mạnh 1>", "<điểm mạnh 2>", "<điểm mạnh 3>"],
+    "weaknesses": ["<điểm cần cải thiện 1>", "<điểm cần cải thiện 2>", "<điểm cần cải thiện 3>"],
+    "suggestions": ["<gợi ý cụ thể 1>", "<gợi ý cụ thể 2>", "<gợi ý cụ thể 3>"]
+  }}
 }}
 
-Lưu ý: 
-- reportContent phải là text thuần (không có markdown formatting)
-- Sử dụng dữ liệu speech quality để đánh giá tiêu chí về kỹ năng thuyết trình
+Lưu ý:
+- reportBody phải là object có 4 trường: summary, strengths, weaknesses, suggestions (tất cả là text thuần, không có markdown)
+- strengths, weaknesses, suggestions phải là mảng string, mỗi phần tử là một câu hoàn chỉnh
+- summary: viết thành 1 đoạn văn liền, không xuống dòng giữa chừng
+- strengths: liệt kê những gì làm tốt (3-5 điểm)
+- weaknesses: liệt kê những gì cần cải thiện (3-5 điểm)
+- suggestions: gợi ý hành động cụ thể để cải thiện (3-5 điểm)
+- Sử dụng dữ liệu speech quality để đánh giá tiêu chí về giọng nói / thuyết trình
+- Sử dụng alignment / slide để đánh giá tiêu chí về slide
 - Sử dụng segment analyses để đánh giá tiêu chí về nội dung và độ liên quan
+- comment trong criterion_scores phải ngắn gọn (1-3 câu), tập trung vào tiêu chí đó
+- suggestions trong criterion_scores là gợi ý riêng cho từng tiêu chí (2-3 câu mỗi tiêu chí)
 
 Return ONLY the JSON object. No markdown, no explanation."""
 
@@ -1145,18 +1264,66 @@ Return ONLY the JSON object. No markdown, no explanation."""
             
             result = json.loads(result_text)
             
-            criterion_scores = result.get('criterion_scores', [])
-            report_content = result.get('reportContent', '')
+            raw_cs = result.get('criterion_scores', [])
+            if isinstance(raw_cs, dict):
+                criterion_scores = list(raw_cs.values())
+            else:
+                criterion_scores = raw_cs or []
+
+            report_body = result.get('reportBody', {})
+            report_content = ""
+            if isinstance(report_body, dict):
+                summary = report_body.get('summary', '')
+                strengths = report_body.get('strengths', [])
+                weaknesses = report_body.get('weaknesses', [])
+                suggestions = report_body.get('suggestions', [])
+
+                lines = []
+                if summary:
+                    lines.append(f"TONG QUAN: {summary}")
+                if strengths:
+                    lines.append("DIEM MANH:")
+                    for s in strengths:
+                        lines.append(f"- {s}")
+                if weaknesses:
+                    lines.append("DIEM CAN CAI THIEN:")
+                    for w in weaknesses:
+                        lines.append(f"- {w}")
+                if suggestions:
+                    lines.append("GOI Y:")
+                    for sg in suggestions:
+                        lines.append(f"- {sg}")
+                report_content = "\n".join(lines)
+            else:
+                report_content = str(report_body) if report_body else ''
+
             overall_score = result.get('overallScore', overall_scores.get('overallScore', 0) if overall_scores else 0)
             
             # Convert criterion scores to dict format
             criterion_scores_dict = {}
             for cs in criterion_scores:
+                if not isinstance(cs, dict):
+                    continue
                 criteria_id = cs.get('criteriaId')
-                if criteria_id:
+                if criteria_id is None:
+                    criteria_id = cs.get('criteria_id')
+                if criteria_id is not None and criteria_id != '':
                     criterion_scores_dict[str(criteria_id)] = cs
+
+            if rubric_criteria:
+                before = len(criterion_scores_dict)
+                criterion_scores_dict = self._fill_missing_rubric_criteria(
+                    rubric_criteria,
+                    criterion_scores_dict,
+                    overall_scores,
+                    speech_quality,
+                )
+                if len(criterion_scores_dict) > before:
+                    logger.info(f"   ↳ After fill: {len(criterion_scores_dict)} criteria (AI returned {before})")
+
+            overall_score = self._weighted_overall_from_criteria(criterion_scores_dict)
             
-            logger.info(f"✅ Rubric-based scoring complete: {len(criterion_scores)} criteria scored")
+            logger.info(f"✅ Rubric-based scoring complete: {len(criterion_scores_dict)} criteria in output")
             
             # Update overall scores with rubric-based score
             updated_overall_scores = {
@@ -1221,32 +1388,41 @@ Return ONLY the JSON object. No markdown, no explanation."""
         criterion_scores = {}
         
         if rubric_criteria:
-            base_score = overall_scores.get('overallScore', 0) if overall_scores else 0
-            
             for criterion in rubric_criteria:
-                criteria_id = criterion.get('criteriaId', criterion.get('criteria_id'))
+                criteria_id = ReportAnalysisService._rubric_row_id(criterion)
+                if criteria_id is None:
+                    logger.warning("Skipping rubric row without criteriaId / classRubricCriteriaId")
+                    continue
                 criteria_name = criterion.get('criteriaName', criterion.get('criteria_name', 'Unknown'))
-                max_score = criterion.get('maxScore', 10)
-                weight = criterion.get('weight', 1.0)
-                
-                # Simple fallback: use base score scaled to max_score
-                score = base_score * max_score
-                
+                max_score = float(criterion.get('maxScore') or 100)
+                weight = float(criterion.get('weight') or 0)
+                factor = self._heuristic_score_factor(criteria_name, overall_scores, speech_quality)
+                score = round(factor * max_score, 2)
+                try:
+                    cid_val = int(criteria_id)
+                except (TypeError, ValueError):
+                    cid_val = criteria_id
+
                 criterion_scores[str(criteria_id)] = {
-                    'criteriaId': criteria_id,
+                    'criteriaId': cid_val,
                     'criteriaName': criteria_name,
-                    'score': round(score, 2),
+                    'score': score,
                     'maxScore': max_score,
                     'weight': weight,
                     'comment': 'Điểm được tính tự động do lỗi AI',
                     'suggestions': ['Vui lòng chạy lại để có đánh giá chi tiết']
                 }
         
+        weighted = self._weighted_overall_from_criteria(criterion_scores)
+        base_os = dict(overall_scores or {})
+        base_os['overallScore'] = weighted
+        base_os['rubricBased'] = True
+
         # Build basic report content
         report_content = f"""
 BÁO CÁO ĐÁNH GIÁ BÀI THUYẾT TRÌNH
 
-Điểm tổng kết: {overall_scores.get('overallScore', 0) if overall_scores else 0:.2f}/1.0
+Điểm tổng kết (theo rubric): {weighted:.2f}/1.0
 
 Nội dung và độ chính xác: {overall_scores.get('contentRelevance', 0) if overall_scores else 0:.2f}/1.0
 Tương đồng ngữ nghĩa: {overall_scores.get('semanticSimilarity', 0) if overall_scores else 0:.2f}/1.0
@@ -1264,7 +1440,7 @@ Chất lượng giọng nói:
         return {
             'criterion_scores': criterion_scores,
             'report_content': report_content,
-            'overall_scores': overall_scores or {}
+            'overall_scores': base_os
         }
 
 

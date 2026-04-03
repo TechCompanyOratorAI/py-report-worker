@@ -88,7 +88,8 @@ class WebhookService:
         segment_analyses: List[Dict[str, Any]] = None,
         overall_scores: Dict[str, Any] = None,
         rubric_scores: Dict[str, Any] = None,
-        metadata: Dict[str, Any] = None
+        metadata: Dict[str, Any] = None,
+        report_body: Dict[str, Any] = None
     ) -> bool:
         """
         Send report completion webhook
@@ -101,6 +102,7 @@ class WebhookService:
             overall_scores: Overall scores
             rubric_scores: Rubric-based scores
             metadata: Additional metadata
+            report_body: Structured report body (summary, strengths, weaknesses, suggestions)
 
         Returns:
             True if successful
@@ -113,7 +115,8 @@ class WebhookService:
             'segmentAnalyses': segment_analyses or [],
             'overallScores': overall_scores or {},
             'rubricScores': rubric_scores or {},
-            'metadata': metadata or {}
+            'metadata': metadata or {},
+            'reportBody': report_body or {}
         }
 
         return self._send_webhook('/webhooks/report-complete', payload)

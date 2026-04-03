@@ -144,7 +144,8 @@ class ReportWorker:
                 segment_analyses=result['segmentAnalyses'],
                 overall_scores=result['overallScores'],
                 rubric_scores=result.get('rubricScores'),
-                metadata=result['metadata']
+                metadata=result['metadata'],
+                report_body=result.get('reportBody')
             )
             
             # Delete message from queue
@@ -214,7 +215,13 @@ class ReportWorker:
                 logger.info(f"   ↳ Created AIReports reportId={effective_report_id}")
             else:
                 logger.info(f"   ↳ Found reportId={effective_report_id} from DB (presentationId={presentation_id})")
-        
+
+        if effective_report_id and effective_class_id:
+            self.database_service.backfill_ai_report_class_setting_fks(
+                report_id=effective_report_id,
+                class_id=effective_class_id,
+            )
+
         # Step 2: Get semantic analysis results from database
         logger.info(f"📊 Loading semantic analysis results for presentation {presentation_id}...")
         segment_analyses_data = self.database_service.get_segment_analyses_for_feedback(presentation_id)
@@ -281,21 +288,35 @@ class ReportWorker:
                     course_description=presentation_data.course_description,
                     topic_requirements=presentation_data.topic_requirements
                 )
-                
-                rubric_scores = rubric_result.get('criterion_scores', {})
+
+                # Extract reportBody for webhook
+                report_body = rubric_result.get('reportBody', {})
                 report_content = rubric_result.get('report_content', '')
                 overall_scores = rubric_result.get('overall_scores', overall_scores_db)
-                
+
+                # Build report_body for webhook (FE-friendly structured format)
+                if isinstance(report_body, dict) and report_body:
+                    webhook_report_body = {
+                        'summary': report_body.get('summary', ''),
+                        'strengths': report_body.get('strengths', []),
+                        'weaknesses': report_body.get('weaknesses', []),
+                        'suggestions': report_body.get('suggestions', [])
+                    }
+                else:
+                    webhook_report_body = {}
+
                 logger.info(f"✅ Rubric-based scoring complete")
-                
+
             except Exception as e:
                 logger.error(f"   - Rubric scoring failed: {e}, using fallback")
                 rubric_scores = {}
                 report_content = ""
                 overall_scores = overall_scores_db
+                webhook_report_body = {}
         else:
             logger.warning(f"   - No rubric criteria found, using basic scoring")
             overall_scores = overall_scores_db
+            webhook_report_body = {}
 
         # Log report completion summary
         overall_score_value = overall_scores.get('overallScore', 0) if overall_scores else 0
@@ -337,7 +358,8 @@ class ReportWorker:
                     criterion_scores=rubric_scores,
                     report_content=report_content,
                     report_status="completed",
-                    generated_by_model=self.report_service.model_name if hasattr(self.report_service, 'model_name') else "report-worker-v1"
+                    generated_by_model=self.report_service.model_name if hasattr(self.report_service, 'model_name') else "report-worker-v1",
+                    report_body=webhook_report_body if 'webhook_report_body' in dir() else None
                 )
 
                 logger.info(f"✅ AIReport saved: reportId={effective_report_id}")
@@ -357,6 +379,7 @@ class ReportWorker:
             'segmentAnalyses': segment_analyses_api,
             'overallScores': overall_scores or {},
             'rubricScores': rubric_scores,
+            'reportBody': webhook_report_body if 'webhook_report_body' in dir() else {},
             'metadata': {
                 'totalSegments': len(segment_analyses),
                 'totalSlides': len(presentation_data.slides),
