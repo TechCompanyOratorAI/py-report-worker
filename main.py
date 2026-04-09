@@ -120,22 +120,25 @@ class ReportWorker:
         logger.info(f"🎯 Processing Job {job_id} - Presentation {presentation_id} - Report {report_id}")
         
         start_time = time.time()
-        
+        effective_report_id = report_id
+
         try:
             result = self._process_report_job(
                 job_id=job_id,
                 presentation_id=presentation_id,
-                report_id=report_id,
+                report_id=effective_report_id,
                 class_id=class_id,
                 rubric_data=rubric_data,
                 settings=msg_settings,
                 metadata=message.metadata,
                 start_time=start_time
             )
-            
+
+            effective_report_id = result['metadata'].get('reportId', effective_report_id)
+
             processing_time = time.time() - start_time
             result['metadata']['processingTime'] = round(processing_time, 2)
-            
+
             # Send success webhook
             self.webhook_service.send_report_complete(
                 job_id=job_id,
@@ -147,26 +150,26 @@ class ReportWorker:
                 metadata=result['metadata'],
                 report_body=result.get('reportBody')
             )
-            
+
             # Delete message from queue
             self.sqs_service.delete_message(message)
-            
+
             # Update statistics
             self.jobs_processed += 1
             self.jobs_succeeded += 1
-            
+
             logger.info(f"✅ Job {job_id} completed in {processing_time:.2f}s")
-            
+
         except Exception as e:
             processing_time = time.time() - start_time
             logger.error(f"❌ Job {job_id} failed: {e}")
-            
+
             # Send failure webhook
             try:
                 self.webhook_service.send_report_failed(
                     job_id=job_id,
                     presentation_id=presentation_id,
-                    report_id=result['metadata']['reportId'] if result and 'metadata' in result else report_id,
+                    report_id=effective_report_id,
                     error_message=str(e)
                 )
             except Exception as webhook_error:
@@ -243,7 +246,15 @@ class ReportWorker:
                 logger.warning(f"   - Presentation exists, has {len(presentation_data_check.transcript_segments)} transcript segments, {len(presentation_data_check.slides)} slides")
             else:
                 logger.warning(f"   - Presentation {presentation_id} not found in database!")
-            raise AnalysisError("No segment analyses found - semantic analysis may not be complete")
+            # Fallback: tiếp tục với empty segment analyses thay vì crash job
+            logger.warning(f"   - Continuing with empty segment analyses — report will use heuristic scores")
+            segment_analyses = []
+            overall_scores_db = {
+                'overallScore': 0,
+                'contentRelevance': 0,
+                'semanticSimilarity': 0,
+                'slideAlignment': 0
+            }
         
         # Step 3: Get speech quality data and analysis results
         logger.info(f"🎤 Loading speech quality and analysis data...")
@@ -293,6 +304,7 @@ class ReportWorker:
                 report_body = rubric_result.get('reportBody', {})
                 report_content = rubric_result.get('report_content', '')
                 overall_scores = rubric_result.get('overall_scores', overall_scores_db)
+                rubric_scores = rubric_result.get('criterion_scores') or {}
 
                 # Build report_body for webhook (FE-friendly structured format)
                 if isinstance(report_body, dict) and report_body:
@@ -316,6 +328,7 @@ class ReportWorker:
         else:
             logger.warning(f"   - No rubric criteria found, using basic scoring")
             overall_scores = overall_scores_db
+            rubric_scores = {}
             webhook_report_body = {}
 
         # Log report completion summary
@@ -355,7 +368,7 @@ class ReportWorker:
                     presentation_id=presentation_id,
                     report_id=effective_report_id,
                     overall_score=overall_score_value,
-                    criterion_scores=rubric_scores,
+                    criterion_scores=rubric_scores if rubric_scores is not None else {},
                     report_content=report_content,
                     report_status="completed",
                     generated_by_model=self.report_service.model_name if hasattr(self.report_service, 'model_name') else "report-worker-v1",

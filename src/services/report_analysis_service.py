@@ -7,7 +7,7 @@ calculating scores and generating issues/suggestions using AI (OpenAI or Gemini)
 
 import json
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 
 # Import AI clients
@@ -32,7 +32,7 @@ from src.services.database_service import (
     get_database_service
 )
 from src.utils.logger import get_logger
-from src.utils.exceptions import AnalysisError
+from src.utils.exceptions import AnalysisError, QuotaExceededError
 
 logger = get_logger(__name__)
 
@@ -84,7 +84,7 @@ class ReportAnalysisService:
                     model=self.model_name,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.3,
-                    max_tokens=4000
+                    max_tokens=200
                 )
                 return response.choices[0].message.content
                 
@@ -96,6 +96,14 @@ class ReportAnalysisService:
                 return response.text
                 
         except Exception as e:
+            err_str = str(e)
+            is_quota = (
+                "'code': 402" in err_str or
+                err_str.startswith("Error code: 402") or
+                (hasattr(e, 'status_code') and e.status_code == 402)
+            )
+            if is_quota:
+                raise QuotaExceededError(str(e)) from e
             logger.error(f"AI API call failed: {e}")
             raise
         
@@ -1020,30 +1028,91 @@ Return ONLY the JSON object. No markdown, no explanation."""
                 "score": score,
                 "maxScore": max_score,
                 "weight": weight,
-                "comment": (
-                    "Điểm và nhận xét bổ sung tự động theo dữ liệu phân tích (semantic / slide / speech) "
-                    "vì phản hồi AI không trả đủ tiêu chí. Nên xem lại bản đánh giá chi tiết sau khi chạy lại."
+                "comment": self._build_fallback_comment(
+                    name, score, max_score, speech_quality, overall_scores,
+                    segment_analyses=None, analysis_results=None,
                 ),
-                "suggestions": [
-                    "Chạy tạo lại báo cáo nếu cần nhận xét sâu hơn cho tiêu chí này.",
-                    "Đối chiếu rubric lớp (ClassRubricCriteria) với nội dung bài trình bày.",
-                ],
+                "suggestions": self._build_fallback_suggestions(
+                    name, score, max_score, speech_quality, overall_scores,
+                    segment_analyses=None, analysis_results=None,
+                ),
             }
             logger.warning(f"   ↳ Filled missing rubric criterion id={key} ({name}) with heuristic score")
         return scores_dict
 
     @staticmethod
     def _weighted_overall_from_criteria(scores_dict: Dict[str, Any]) -> float:
-        """Overall 0–1 from weighted criterion scores (weights assumed to sum ~100)."""
-        total = 0.0
+        """Overall 0–1 as simple average of normalized criterion scores (score/maxScore), divided by 3."""
+        normalized_scores = []
         for cs in (scores_dict or {}).values():
-            w = float(cs.get("weight") or 0)
             max_v = float(cs.get("maxScore") or 100)
             sc = float(cs.get("score") or 0)
             if max_v <= 0:
                 continue
-            total += (w / 100.0) * (sc / max_v)
-        return min(1.0, max(0.0, total))
+            normalized_scores.append(sc / max_v)
+
+        if not normalized_scores:
+            return 0.0
+
+        average = sum(normalized_scores) / len(normalized_scores)
+        return min(1.0, max(0.0, average))
+
+    def _build_vietnamese_report_summary(
+        self,
+        weighted_overall: float,
+        criterion_scores_dict: Dict[str, Any],
+        dim_scores: Optional[Dict],
+        rubric_criteria: Optional[List[Dict]] = None,
+        speech_quality: Optional[Dict] = None,
+    ) -> str:
+        """Khối text chuẩn: tiêu đề, điểm rubric, từng tiêu chí (chuẩn hoá /1.0), 3 chỉ số semantic."""
+        lines = [
+            "BÁO CÁO ĐÁNH GIÁ BÀI THUYẾT TRÌNH",
+            "",
+            f"Điểm tổng kết (theo rubric): {weighted_overall:.2f}/1.0",
+            "",
+        ]
+        ordered_keys: List[str] = []
+        if rubric_criteria:
+            for c in rubric_criteria:
+                rid = self._rubric_row_id(c)
+                if rid is not None:
+                    ordered_keys.append(str(rid))
+        else:
+            ordered_keys = list((criterion_scores_dict or {}).keys())
+
+        for rid in ordered_keys:
+            cs = (criterion_scores_dict or {}).get(rid)
+            if not cs or not isinstance(cs, dict):
+                continue
+            name = cs.get("criteriaName", "Tiêu chí")
+            score = float(cs.get("score") or 0)
+            max_s = float(cs.get("maxScore") or 1) or 1.0
+            norm = (score / max_s) if max_s else 0.0
+            lines.append(f"{name}: {norm:.2f}/1.0")
+
+        lines.append("")
+        ds = dim_scores or {}
+        lines.append(
+            f"Nội dung và độ chính xác: {float(ds.get('contentRelevance', 0) or 0):.2f}/1.0"
+        )
+        lines.append(
+            f"Tương đồng ngữ nghĩa: {float(ds.get('semanticSimilarity', 0) or 0):.2f}/1.0"
+        )
+        lines.append(
+            f"Tương thích Slide - Audio: {float(ds.get('slideAlignment', 0) or 0):.2f}/1.0"
+        )
+
+        text = "\n".join(lines)
+        if speech_quality:
+            text += f"""
+
+Chất lượng giọng nói:
+- Fluency: {speech_quality.get('fluencyScore', 'N/A')}
+- Clarity: {speech_quality.get('clarityScore', 'N/A')}
+- Confidence: {speech_quality.get('confidenceScore', 'N/A')}
+"""
+        return text
 
     def calculate_rubric_scores(
         self,
@@ -1120,13 +1189,22 @@ Return ONLY the JSON object. No markdown, no explanation."""
         # Prepare speech quality data
         speech_text = ""
         if speech_quality:
+            # Audio duration for reference
+            audio_duration = speech_quality.get('audioDuration')
+            audio_info = f"- Audio Duration: {audio_duration:.1f}s" if audio_duration else ""
+
             speech_text = f"""
 - Fluency Score: {speech_quality.get('fluencyScore', 'N/A')}
 - Clarity Score: {speech_quality.get('clarityScore', 'N/A')}
 - Confidence Score: {speech_quality.get('confidenceScore', 'N/A')}
 - Overall Speech Score: {speech_quality.get('overallScore', 'N/A')}
-- Total Hesitations: {speech_quality.get('totalHesitationCount', 0)}
-- Hesitation Rate: {speech_quality.get('hesitationRate', 0)}
+- Speaking Rate: {speech_quality.get('speakingRate', 'N/A')} syllables/min
+- Speech Rhythm Score: {speech_quality.get('speechRhythmScore', 'N/A')}
+- Silence Ratio: {speech_quality.get('silenceRatio', 'N/A')}
+- Total Hesitations: {speech_quality.get('totalHesitationCount', 0)} times
+- Total Hesitation Time: {(speech_quality.get('totalHesitationTime') or 0):.1f}s
+- Hesitation Rate: {(speech_quality.get('hesitationRate') or 0):.2f} times/min
+{audio_info}
 """
         
         if hesitation_patterns:
@@ -1145,7 +1223,7 @@ Return ONLY the JSON object. No markdown, no explanation."""
 - Average Relevance Score: {avg_relevance:.2f}/1.0
 - Average Semantic Score: {avg_semantic:.2f}/1.0
 - Average Alignment Score: {avg_alignment:.2f}/1.0
-- Overall Score: {overall_scores.get('overallScore', 0):.2f}/1.0
+- Overall Score: {float(overall_scores.get('overallScore') or 0):.2f}/1.0
 """
         
         # Prepare AnalysisResults data
@@ -1241,7 +1319,22 @@ Lưu ý:
 - strengths: liệt kê những gì làm tốt (3-5 điểm)
 - weaknesses: liệt kê những gì cần cải thiện (3-5 điểm)
 - suggestions: gợi ý hành động cụ thể để cải thiện (3-5 điểm)
-- Sử dụng dữ liệu speech quality để đánh giá tiêu chí về giọng nói / thuyết trình
+
+## Hướng dẫn đánh giá Speech Quality (Voice Quality):
+- fluencyScore: Độ trôi chảy (0-1) → cao = tốt
+- clarityScore: Độ rõ ràng (0-1) → cao = tốt
+- confidenceScore: Độ tự tin (0-1) → cao = tốt
+- speakingRate: Tốc độ nói (syllables/min) → tối ưu 120-150 syllables/min
+- speechRhythmScore: Nhịp điệu (0-1) → cao = tốt
+- silenceRatio: Tỉ lệ im lặng (0-1) → hợp lý < 30%
+- totalHesitationCount: Tổng số lần ngập ngừng → ít = tốt
+- totalHesitationTime: Tổng thời gian ngập ngừng (giây) → ít = tốt
+- hesitationRate: Tỉ lệ ngập ngừng (lần/phút) → ít = tốt
+- audioDuration: Thời lượng audio (giây)
+
+**Nếu dữ liệu speech quality có điểm > 0**: Đánh giá chi tiết dựa trên các chỉ số trên
+**Nếu dữ liệu speech quality trống hoặc tất cả = 0**: Ghi nhận "Không có dữ liệu phân tích giọng nói" và cho điểm 0, không tự suy đoán điểm số
+
 - Sử dụng alignment / slide để đánh giá tiêu chí về slide
 - Sử dụng segment analyses để đánh giá tiêu chí về nội dung và độ liên quan
 - comment trong criterion_scores phải ngắn gọn (1-3 câu), tập trung vào tiêu chí đó
@@ -1250,114 +1343,159 @@ Lưu ý:
 Return ONLY the JSON object. No markdown, no explanation."""
 
         try:
-            result_text = self._call_ai(prompt)
-            
-            # Parse AI response
-            if result_text.startswith('```'):
-                result_text = result_text.split('```')[1]
-                if result_text.startswith('json'):
-                    result_text = result_text[4:]
-            result_text = result_text.strip().strip('`')
-            
-            # Clean up any non-printable characters
-            result_text = ''.join(char for char in result_text if ord(char) >= 32 or char in '\n\t\r')
-            
-            result = json.loads(result_text)
-            
-            raw_cs = result.get('criterion_scores', [])
-            if isinstance(raw_cs, dict):
-                criterion_scores = list(raw_cs.values())
-            else:
-                criterion_scores = raw_cs or []
+            result = None
+            for attempt in range(1, 4):
+                try:
+                    result_text = self._call_ai(prompt)
 
-            report_body = result.get('reportBody', {})
+                    # Parse AI response
+                    if result_text.startswith('```'):
+                        result_text = result_text.split('```')[1]
+                        if result_text.startswith('json'):
+                            result_text = result_text[4:]
+                    result_text = result_text.strip().strip('`')
+
+                    # Clean up any non-printable characters
+                    result_text = ''.join(char for char in result_text if ord(char) >= 32 or char in '\n\t\r')
+
+                    # Attempt to fix common JSON issues from AI responses
+                    result_text = self._fix_ai_json(result_text)
+
+                    result = json.loads(result_text)
+                    break  # success
+
+                except QuotaExceededError:
+                    raise  # propagate quota errors immediately
+                except json.JSONDecodeError as e:
+                    if attempt == 3:
+                        raise  # propagate to outer try
+                    logger.warning(f"   ↳ AI JSON parse attempt {attempt}/3 failed: {e}")
+
+            if result is None:
+                raise ValueError("AI returned no parseable response after 3 attempts")
+
+        except QuotaExceededError as e:
+            logger.warning(f"AI quota exceeded, using fallback")
+            return self._calculate_rubric_scores_fallback(
+                segment_analyses,
+                overall_scores,
+                speech_quality,
+                analysis_results,
+                rubric_criteria
+            )
+        except Exception:
+            logger.warning(f"AI rubric scoring failed, using fallback")
+            return self._calculate_rubric_scores_fallback(
+                segment_analyses,
+                overall_scores,
+                speech_quality,
+                analysis_results,
+                rubric_criteria
+            )
+
+        raw_cs = result.get('criterion_scores', [])
+        if isinstance(raw_cs, dict):
+            criterion_scores = list(raw_cs.values())
+        else:
+            criterion_scores = raw_cs or []
+
+        report_body = result.get('reportBody', {})
+        if not isinstance(report_body, dict):
+            report_body = {}
+        report_content = ""
+        if report_body:
+            summary = report_body.get('summary', '')
+            strengths = report_body.get('strengths', [])
+            weaknesses = report_body.get('weaknesses', [])
+            suggestions = report_body.get('suggestions', [])
+
+            lines = []
+            if summary:
+                lines.append(f"TONG QUAN: {summary}")
+            if strengths:
+                lines.append("DIEM MANH:")
+                for s in strengths:
+                    lines.append(f"- {s}")
+            if weaknesses:
+                lines.append("DIEM CAN CAI THIEN:")
+                for w in weaknesses:
+                    lines.append(f"- {w}")
+            if suggestions:
+                lines.append("GOI Y:")
+                for sg in suggestions:
+                    lines.append(f"- {sg}")
+            report_content = "\n".join(lines)
+        else:
             report_content = ""
-            if isinstance(report_body, dict):
-                summary = report_body.get('summary', '')
-                strengths = report_body.get('strengths', [])
-                weaknesses = report_body.get('weaknesses', [])
-                suggestions = report_body.get('suggestions', [])
 
-                lines = []
-                if summary:
-                    lines.append(f"TONG QUAN: {summary}")
-                if strengths:
-                    lines.append("DIEM MANH:")
-                    for s in strengths:
-                        lines.append(f"- {s}")
-                if weaknesses:
-                    lines.append("DIEM CAN CAI THIEN:")
-                    for w in weaknesses:
-                        lines.append(f"- {w}")
-                if suggestions:
-                    lines.append("GOI Y:")
-                    for sg in suggestions:
-                        lines.append(f"- {sg}")
-                report_content = "\n".join(lines)
-            else:
-                report_content = str(report_body) if report_body else ''
+        overall_score = result.get('overallScore', overall_scores.get('overallScore', 0) if overall_scores else 0)
 
-            overall_score = result.get('overallScore', overall_scores.get('overallScore', 0) if overall_scores else 0)
-            
-            # Convert criterion scores to dict format
-            criterion_scores_dict = {}
-            for cs in criterion_scores:
-                if not isinstance(cs, dict):
-                    continue
-                criteria_id = cs.get('criteriaId')
-                if criteria_id is None:
-                    criteria_id = cs.get('criteria_id')
-                if criteria_id is not None and criteria_id != '':
-                    criterion_scores_dict[str(criteria_id)] = cs
+        # Convert criterion scores to dict format
+        criterion_scores_dict = {}
+        for cs in criterion_scores:
+            if not isinstance(cs, dict):
+                continue
+            criteria_id = cs.get('criteriaId')
+            if criteria_id is None:
+                criteria_id = cs.get('criteria_id')
+            if criteria_id is not None and criteria_id != '':
+                criterion_scores_dict[str(criteria_id)] = cs
 
-            if rubric_criteria:
-                before = len(criterion_scores_dict)
-                criterion_scores_dict = self._fill_missing_rubric_criteria(
-                    rubric_criteria,
-                    criterion_scores_dict,
-                    overall_scores,
-                    speech_quality,
-                )
-                if len(criterion_scores_dict) > before:
-                    logger.info(f"   ↳ After fill: {len(criterion_scores_dict)} criteria (AI returned {before})")
-
-            overall_score = self._weighted_overall_from_criteria(criterion_scores_dict)
-            
-            logger.info(f"✅ Rubric-based scoring complete: {len(criterion_scores_dict)} criteria in output")
-            
-            # Update overall scores with rubric-based score
-            updated_overall_scores = {
-                'overallScore': overall_score,
-                'contentRelevance': overall_scores.get('contentRelevance', 0) if overall_scores else 0,
-                'semanticSimilarity': overall_scores.get('semanticSimilarity', 0) if overall_scores else 0,
-                'slideAlignment': overall_scores.get('slideAlignment', 0) if overall_scores else 0,
-                'rubricBased': True
-            }
-            
-            return {
-                'criterion_scores': criterion_scores_dict,
-                'report_content': report_content,
-                'overall_scores': updated_overall_scores
-            }
-            
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse AI rubric response: {e}")
-            return self._calculate_rubric_scores_fallback(
-                segment_analyses, 
-                overall_scores, 
+        if rubric_criteria:
+            before = len(criterion_scores_dict)
+            criterion_scores_dict = self._fill_missing_rubric_criteria(
+                rubric_criteria,
+                criterion_scores_dict,
+                overall_scores,
                 speech_quality,
-                analysis_results,
-                rubric_criteria
             )
-        except Exception as e:
-            logger.warning(f"AI API error in rubric scoring: {e}")
-            return self._calculate_rubric_scores_fallback(
-                segment_analyses, 
-                overall_scores, 
-                speech_quality,
-                analysis_results,
-                rubric_criteria
-            )
+            if len(criterion_scores_dict) > before:
+                logger.info(f"   ↳ After fill: {len(criterion_scores_dict)} criteria (AI returned {before})")
+
+        overall_score = self._weighted_overall_from_criteria(criterion_scores_dict)
+
+        logger.info(f"✅ Rubric-based scoring complete: {len(criterion_scores_dict)} criteria in output")
+
+        # Update overall scores with rubric-based score
+        updated_overall_scores = {
+            'overallScore': overall_score,
+            'contentRelevance': overall_scores.get('contentRelevance', 0) if overall_scores else 0,
+            'semanticSimilarity': overall_scores.get('semanticSimilarity', 0) if overall_scores else 0,
+            'slideAlignment': overall_scores.get('slideAlignment', 0) if overall_scores else 0,
+            'rubricBased': True
+        }
+
+        summary_block = self._build_vietnamese_report_summary(
+            overall_score,
+            criterion_scores_dict,
+            updated_overall_scores,
+            rubric_criteria,
+            speech_quality,
+        )
+        detail = report_content.strip()
+        report_content = f"{summary_block}\n\n{detail}" if detail else summary_block
+
+        return {
+            'criterion_scores': criterion_scores_dict,
+            'report_content': report_content,
+            'overall_scores': updated_overall_scores,
+            'reportBody': report_body,
+        }
+
+    def _fix_ai_json(self, text: str) -> str:
+        """Attempt to fix common JSON issues in AI responses."""
+        lines = text.split('\n')
+        fixed_lines = []
+        for line in lines:
+            # Remove lines that look like instruction fragments (non-JSON text)
+            stripped = line.strip()
+            if stripped.startswith('## ') or stripped.startswith('**') or stripped.startswith('#'):
+                continue
+            # Remove trailing commas before } or ]
+            if re.search(r',\s*[}\]]', line):
+                line = re.sub(r',(\s*[}\]])', r'\1', line)
+            fixed_lines.append(line)
+        return '\n'.join(fixed_lines)
 
     def _format_quality_data(self, data: Dict, fields: List[str]) -> str:
         """Format quality data for AI prompt"""
@@ -1373,6 +1511,587 @@ Return ONLY the JSON object. No markdown, no explanation."""
                 lines.append(f"- {field_display}: {value}")
         
         return "\n".join(lines) if lines else "Chưa có dữ liệu"
+
+    # ─────────────────────────────────────────────────────────────
+    # Fallback feedback builders (called when AI call fails)
+    # ─────────────────────────────────────────────────────────────
+
+    def _extract_signal(
+        self,
+        criteria_name: str,
+        overall_scores: Optional[Dict],
+        speech_quality: Optional[Dict],
+        segment_analyses: Optional[List[Dict]],
+        analysis_results: Optional[Dict],
+    ) -> Dict[str, Any]:
+        """Gom tất cả tín hiệu số cụ thể thành dict thống nhất để dùng chung cho comment & suggestion."""
+        n = (criteria_name or "").lower()
+        os = overall_scores or {}
+        sq = speech_quality or {}
+        segs = segment_analyses or []
+        ar = analysis_results or {}
+
+        # Ba chỉ số nền tảng (luôn có dù segmentAnalyses trống)
+        relevance    = float(os.get("contentRelevance", 0) or 0)
+        semantic     = float(os.get("semanticSimilarity", 0) or 0)
+        alignment    = float(os.get("slideAlignment", 0) or 0)
+        overall      = float(os.get("overallScore", 0) or 0)
+        seg_count    = len(segs)
+
+        # Speech quality signals
+        sq_overall      = float(sq.get("overallScore", 0) or 0)
+        fluency         = float(sq.get("fluencyScore", 0) or 0)
+        clarity         = float(sq.get("clarityScore", 0) or 0)
+        confidence      = float(sq.get("confidenceScore", 0) or 0)
+        hesitation      = int(sq.get("totalHesitationCount", 0) or 0)
+        hesitation_time = float(sq.get("totalHesitationTime", 0) or 0)
+        hesitation_rate = float(sq.get("hesitationRate", 0) or 0)
+        speaking_rate   = float(sq.get("speakingRate", 0) or 0)
+        speech_rhythm   = float(sq.get("speechRhythmScore", 0) or 0)
+        silence_ratio   = float(sq.get("silenceRatio", 0) or 0)
+        audio_duration  = float(sq.get("audioDuration", 0) or 0)
+        has_sq_data     = sq_overall > 0 or fluency > 0
+
+        # Content quality từ AnalysisResults (nếu có)
+        cq = ar.get("contentQuality") or {}
+        accuracy = float(cq.get("accuracyScore", 0) or 0)
+        depth    = float(cq.get("depthScore", 0) or 0)
+
+        # Slide quality từ AnalysisResults
+        dq = ar.get("deliveryQuality") or {}
+        voice_rate = float(dq.get("speechRateWpm", 0) or 0)
+        voice_qual = float(dq.get("voiceQuality", 0) or 0)
+
+        # Lấy điểm theo category
+        if any(k in n for k in ("content", "nội dung", "accuracy", "chính xác")):
+            primary_score   = relevance
+            secondary_score = semantic
+            detail_scores   = {"relevance": relevance, "semantic": semantic,
+                               "accuracy": accuracy, "depth": depth}
+        elif any(k in n for k in ("slide", "powerpoint", "trang chiếu", "visuals", "hình ảnh")):
+            primary_score   = alignment
+            secondary_score = relevance
+            detail_scores   = {"alignment": alignment, "relevance": relevance}
+        elif any(k in n for k in ("voice", "speech", "giọng", "delivery", "oral")):
+            primary_score   = sq_overall if sq_overall > 0 else overall
+            secondary_score = fluency
+            detail_scores   = {"fluency": fluency, "clarity": clarity,
+                               "confidence": confidence,
+                               "hesitation": hesitation,
+                               "speechRate": voice_rate}
+        elif any(k in n for k in ("structure", "organization", "cấu trúc", "logical")):
+            primary_score   = overall
+            secondary_score = alignment
+            detail_scores   = {"overall": overall, "alignment": alignment}
+        elif any(k in n for k in ("engagement", "tương tác", "interest", "hứng thú")):
+            primary_score   = overall
+            secondary_score = semantic
+            detail_scores   = {"overall": overall, "semantic": semantic}
+        else:
+            primary_score   = overall
+            secondary_score = 0
+            detail_scores   = {"overall": overall}
+
+        return {
+            "seg_count": seg_count,
+            "relevance": relevance, "semantic": semantic, "alignment": alignment,
+            "overall": overall,
+            "sq_overall": sq_overall, "fluency": fluency, "clarity": clarity,
+            "confidence": confidence, "hesitation": hesitation,
+            "hesitation_time": hesitation_time, "hesitation_rate": hesitation_rate,
+            "speaking_rate": speaking_rate, "speech_rhythm": speech_rhythm,
+            "silence_ratio": silence_ratio, "audio_duration": audio_duration,
+            "has_sq_data": has_sq_data,
+            "voice_rate": voice_rate, "voice_qual": voice_qual,
+            "accuracy": accuracy, "depth": depth,
+            "primary_score": primary_score,
+            "secondary_score": secondary_score,
+            "detail_scores": detail_scores,
+        }
+
+    def _build_fallback_comment(
+        self,
+        criteria_name: str,
+        score: float,
+        max_score: float,
+        speech_quality: Optional[Dict] = None,
+        overall_scores: Optional[Dict] = None,
+        segment_analyses: Optional[List[Dict]] = None,
+        analysis_results: Optional[Dict] = None,
+    ) -> str:
+        """Generate a meaningful comment referencing actual signal numbers (like AI output)."""
+        sig = self._extract_signal(
+            criteria_name, overall_scores, speech_quality,
+            segment_analyses, analysis_results,
+        )
+        norm    = score / max_score if max_score else 0.0
+        n       = (criteria_name or "").lower()
+        seg_n   = sig["seg_count"]
+
+        # ── Content Quality ───────────────────────────────────────
+        if any(k in n for k in ("content", "nội dung")):
+            if sig["has_sq_data"]:
+                base = (
+                    f"Nội dung bài thuyết trình có điểm relevance {sig['relevance']:.2f}/1.0 "
+                    f"và semantic {sig['semantic']:.2f}/1.0."
+                )
+            else:
+                base = (
+                    f"Không có dữ liệu phân tích semantic chi tiết cho bài thuyết trình này "
+                    f"(điểm overall {sig['overall']:.2f}/1.0)."
+                )
+            if norm >= 0.7:
+                return (
+                    f"{base} Điểm quy đổi {score:.1f}/{max_score:.0f} — nội dung bám sát đề tài "
+                    f"và có độ sâu phù hợp, thể hiện sự chuẩn bị kỹ lưỡng."
+                )
+            elif norm >= 0.4:
+                    acc_part = (
+                        f"Điểm accuracy {sig['accuracy']:.2f}/1.0"
+                        if sig['accuracy'] > 0
+                        else "Chưa có dữ liệu độ chính xác."
+                    )
+                    return (
+                        f"{base} Điểm quy đổi {score:.1f}/{max_score:.0f} — nội dung cơ bản đúng "
+                        f"nhưng {'còn thiếu chiều sâu hoặc ví dụ minh họa cụ thể' if sig['depth'] < 0.5 else 'cần được triển khai chi tiết hơn'}. "
+                        f"{acc_part} "
+                        f"cho thấy vẫn còn{' sai sót về số liệu' if sig['accuracy'] > 0 and sig['accuracy'] < 0.6 else ' chỗ cần kiểm chứng lại'}."
+                    )
+            else:
+                rel_note = (
+                    f"Điểm relevance chỉ {sig['relevance']:.2f}/1.0 phản ánh nội dung chưa bám sát mục tiêu học tập."
+                    if sig['relevance'] < 0.5 else ""
+                )
+                sem_note = (
+                    f"Điểm semantic {sig['semantic']:.2f}/1.0 cho thấy bài trình bày còn thiếu tính mạch lạc."
+                    if sig['semantic'] < 0.5 else ""
+                )
+                extra = " ".join(p for p in [rel_note, sem_note] if p)
+                body_qual = "chưa đáp ứng yêu cầu cốt lõi của môn học" if seg_n > 0 else "rất hạn chế do thiếu dữ liệu phân tích chi tiết"
+                return (
+                    f"{base} Điểm quy đổi {score:.1f}/{max_score:.0f} — nội dung {body_qual}. "
+                    f"{extra}"
+                )
+
+        # ── Slide Quality ────────────────────────────────────────
+        if any(k in n for k in ("slide", "powerpoint", "trang chiếu", "visuals", "hình ảnh")):
+            align_note = ""
+            if sig["alignment"] > 0:
+                align_note = (
+                    f" Điểm Alignment chỉ {sig['alignment']:.2f}/1.0 "
+                    f"{'cho thấy các slide chưa trực quan hóa được nội dung audio' if sig['alignment'] < 0.5 else 'phản ánh slide cơ bản đồng bộ với lời nói'}."
+                )
+            if seg_n > 0:
+                seg_note = f" Dữ liệu được tính từ {seg_n} đoạn transcript."
+            else:
+                seg_note = " Không có dữ liệu phân tích đoạn audio."
+            if norm >= 0.7:
+                return (
+                    f"Chất lượng slide được đánh giá khá tốt với điểm quy đổi {score:.1f}/{max_score:.0f}.{align_note}{seg_note}"
+                )
+            elif norm >= 0.4:
+                return (
+                    f"Với điểm quy đổi {score:.1f}/{max_score:.0f}, chất lượng slide ở mức trung bình.{align_note}"
+                    f"{' Số lượng segment ' + str(seg_n) + ' cho thấy bài có thể dài dòng hoặc bị chia nhỏ không hợp lý.' if seg_n > 30 else seg_note}"
+                )
+            else:
+                return (
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — chất lượng slide chưa đạt yêu cầu.{align_note}"
+                    f"{' Điểm Alignment thấp phản ánh các slide có thể không trực quan hóa được nội dung, khiến người nghe khó theo dõi.' if sig['alignment'] > 0 else ''}"
+                    f"{seg_note}"
+                )
+
+        # ── Voice Quality ────────────────────────────────────────
+        if any(k in n for k in ("voice", "speech", "giọng", "delivery", "oral")):
+            if not sig["has_sq_data"]:
+                return (
+                    f"Không có dữ liệu phân tích giọng nói khả dụng để đánh giá tiêu chí này. "
+                    f"Hệ thống ghi nhận trạng thái 'Chưa có dữ liệu phân tích giọng nói'. "
+                    f"Điểm số được để ở mức 0 do thiếu dữ liệu đầu vào để xử lý."
+                )
+            parts = []
+            if sig["fluency"] >= 0.6:
+                parts.append(f"trôi chảy ({sig['fluency']:.2f}/1.0)")
+            else:
+                parts.append(f"ngắt quãng nhiều ({sig['fluency']:.2f}/1.0)")
+            if sig["clarity"] >= 0.6:
+                parts.append(f"phát âm rõ ({sig['clarity']:.2f}/1.0)")
+            else:
+                parts.append(f"cần rõ hơn ({sig['clarity']:.2f}/1.0)")
+            if sig["confidence"] >= 0.6:
+                parts.append(f"tự tin ({sig['confidence']:.2f}/1.0)")
+            else:
+                parts.append(f"cần tự tin hơn ({sig['confidence']:.2f}/1.0)")
+            sq_text = "; ".join(parts)
+
+            # Speaking rate analysis (optimal: 120-150 syllables/min for presentation)
+            rate_note = ""
+            if sig["speaking_rate"] > 0:
+                sr = sig["speaking_rate"]
+                if 100 <= sr <= 180:
+                    rate_note = f" Tốc độ nói {sr:.0f} syllables/min phù hợp."
+                elif sr < 100:
+                    rate_note = f" Tốc độ nói {sr:.0f} syllables/min — hơi chậm."
+                else:
+                    rate_note = f" Tốc độ nói {sr:.0f} syllables/min — hơi nhanh."
+
+            # Hesitation analysis
+            hesit_note = ""
+            if sig["hesitation"] > 0 or sig["hesitation_time"] > 0:
+                hesit_note = f" Ghi nhận {sig['hesitation']} lần ngập ngừng (tổng {sig['hesitation_time']:.1f}s)."
+                if sig["hesitation_rate"] > 0:
+                    hesit_note += f" Tỉ lệ {sig['hesitation_rate']:.1f} lần/phút."
+
+            # Speech rhythm and silence analysis
+            rhythm_note = ""
+            if sig["speech_rhythm"] > 0:
+                rhythm_note = f" Nhịp điệu speech {sig['speech_rhythm']:.2f}/1.0."
+            if sig["silence_ratio"] > 0:
+                sr_val = sig["silence_ratio"] * 100
+                if sr_val < 30:
+                    rhythm_note += f" Tỉ lệ im lặng {sr_val:.1f}% — hợp lý."
+                elif sr_val > 50:
+                    rhythm_note += f" Tỉ lệ im lặng {sr_val:.1f}% — cao, có thể do ngập ngừng nhiều."
+
+            if norm >= 0.7:
+                return (
+                    f"Chất lượng giọng nói khá tốt: {sq_text}.{rate_note}{hesit_note}{rhythm_note} "
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — người thuyết trình thể hiện sự chuẩn bị tốt."
+                )
+            elif norm >= 0.4:
+                return (
+                    f"Giọng nói ở mức trung bình: {sq_text}.{rate_note}{hesit_note}{rhythm_note} "
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — cần cải thiện thêm trôi chảy và sự tự tin."
+                )
+            else:
+                return (
+                    f"Chất lượng giọng nói chưa đạt yêu cầu: {sq_text}.{rate_note}{hesit_note}{rhythm_note} "
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — đây là điểm cần được ưu tiên cải thiện."
+                )
+
+        # ── Structure / Organization ──────────────────────────────
+        if any(k in n for k in ("structure", "organization", "cấu trúc", "logical")):
+            if norm >= 0.7:
+                return (
+                    f"Với điểm quy đổi {score:.1f}/{max_score:.0f}, bố cục bài trình bày logic, "
+                    f"có mở đầu và kết luận rõ ràng, luồng ý chính mạch lạc "
+                    f"(overall {sig['overall']:.2f}/1.0)."
+                )
+            elif norm >= 0.4:
+                return (
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — cấu trúc cơ bản đúng nhưng "
+                    f"{'cần cải thiện luồng liên kết giữa các phần' if sig['alignment'] < 0.5 else 'cần thêm phần chuyển tiếp rõ ràng hơn'}. "
+                    f"Điểm alignment {sig['alignment']:.2f}/1.0."
+                )
+            else:
+                return (
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — cấu trúc bài trình bày "
+                    f"thiếu logic rõ ràng, các phần chưa liên kết mạch lạc với nhau. "
+                    f"Điểm overall {sig['overall']:.2f}/1.0."
+                )
+
+        # ── Engagement ───────────────────────────────────────────
+        if any(k in n for k in ("engagement", "tương tác", "interest", "hứng thú")):
+            if norm >= 0.7:
+                return (
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — bài trình bày thu hút sự chú ý "
+                    f"của khán giả, có sự tương tác tốt (overall {sig['overall']:.2f}/1.0)."
+                )
+            elif norm >= 0.4:
+                return (
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — có một số khoảnh khắc hứng thú "
+                    f"nhưng chưa đều và cần tăng cường tính tương tác xuyên suốt bài trình bày."
+                )
+            else:
+                return (
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — bài trình bày chưa thu hút được "
+                    f"sự chú ý của khán giả một cách hiệu quả. Cần thêm ví dụ thực tế, "
+                    f"câu hỏi dẫn dắt hoặc tình huống giả định."
+                )
+
+        # ── Generic ──────────────────────────────────────────────
+        if norm >= 0.7:
+            return (
+                f"Tiêu chí '{criteria_name}' đạt mức khá với điểm {score:.1f}/{max_score:.0f} "
+                f"(overall {sig['overall']:.2f}/1.0). Cần duy trì và phát huy."
+            )
+        elif norm >= 0.4:
+            return (
+                f"Tiêu chí '{criteria_name}' đạt mức trung bình với điểm {score:.1f}/{max_score:.0f} "
+                f"(overall {sig['overall']:.2f}/1.0). Cần cải thiện thêm để nâng cao điểm tổng kết."
+            )
+        else:
+            return (
+                f"Tiêu chí '{criteria_name}' chưa đạt yêu cầu với điểm {score:.1f}/{max_score:.0f} "
+                f"(overall {sig['overall']:.2f}/1.0). Cần được ưu tiên cải thiện đáng kể."
+            )
+
+    def _build_fallback_suggestions(
+        self,
+        criteria_name: str,
+        score: float,
+        max_score: float,
+        speech_quality: Optional[Dict] = None,
+        overall_scores: Optional[Dict] = None,
+        segment_analyses: Optional[List[Dict]] = None,
+        analysis_results: Optional[Dict] = None,
+    ) -> List[str]:
+        """Generate 3 concrete action-item suggestions referencing actual data (like AI output)."""
+        sig = self._extract_signal(
+            criteria_name, overall_scores, speech_quality,
+            segment_analyses, analysis_results,
+        )
+        norm = score / max_score if max_score else 0.0
+        n    = (criteria_name or "").lower()
+        suggestions: List[str] = []
+
+        # ── Content Quality ───────────────────────────────────────
+        if any(k in n for k in ("content", "nội dung")):
+            if norm >= 0.7:
+                suggestions.append(
+                    f"Tiếp tục duy trì và phát triển thêm độ sâu nội dung, đặc biệt ở "
+                    f"những phần có điểm accuracy thấp (hiện tại {sig['accuracy']:.2f}/1.0) "
+                    f"để nâng cao tính thuyết phục."
+                )
+                suggestions.append(
+                    f"Tăng cường liên kết giữa các ý bằng các câu chuyển tiếp rõ ràng, "
+                    f"giúp bài trình bày mạch lạc hơn."
+                )
+            elif norm >= 0.4:
+                suggestions.append(
+                    f"Tái cấu trúc nội dung để bám sát mục tiêu học tập: điểm relevance hiện tại "
+                    f"chỉ {sig['relevance']:.2f}/1.0, cần tập trung vào những yêu cầu cốt lõi "
+                    f"của đề tài thay vì nói chung chung."
+                )
+                if sig["semantic"] < 0.6:
+                    suggestions.append(
+                        f"Cải thiện tính mạch lạc của bài trình bày: điểm semantic "
+                        f"{sig['semantic']:.2f}/1.0 cho thấy các đoạn trình bày còn rời rạc, "
+                        f"thiếu luồng ý liên kết. Sử dụng cấu trúc câu chuyện hoặc logic "
+                        f"để dẫn dắt người nghe."
+                    )
+                suggestions.append(
+                    f"Bổ sung ví dụ thực tế hoặc tình huống giả định (case study) để minh họa "
+                    f"cho các khái niệm trừu tượng, giúp người nghe dễ hiểu và ghi nhớ hơn."
+                )
+            else:
+                suggestions.append(
+                    f"Nghiên cứu lại đề tài một cách hệ thống: xác định rõ 3-5 điểm chính "
+                    f"cần trình bày và xây dựng nội dung xung quanh chúng. Điểm relevance "
+                    f"{sig['relevance']:.2f}/1.0 và semantic {sig['semantic']:.2f}/1.0 cho thấy "
+                    f"bài trình bày chưa bám sát mục tiêu."
+                )
+                if sig["depth"] > 0 and sig["depth"] < 0.5:
+                    suggestions.append(
+                        f"Tăng cường độ sâu của nội dung kỹ thuật, tránh nói chung chung "
+                        f"về nguyên lý mà thiếu chi tiết triển khai cụ thể "
+                        f"(điểm depth hiện tại {sig['depth']:.2f}/1.0)."
+                    )
+                suggestions.append(
+                    f"Sử dụng nguồn tài liệu đáng tin cậy (bài báo khoa học, tài liệu chính thống) "
+                    f"để củng cố các luận điểm chính, tránh thông tin chưa được kiểm chứng."
+                )
+
+        # ── Slide Quality ────────────────────────────────────────
+        elif any(k in n for k in ("slide", "powerpoint", "trang chiếu", "visuals", "hình ảnh")):
+            if norm >= 0.7:
+                suggestions.append(
+                    f"Giữ vững phong cách thiết kế slide hiện tại, đảm bảo mỗi slide có "
+                    f"đúng một thông điệp chính và dễ đọc trong 3-5 giây đầu."
+                )
+                suggestions.append(
+                    f"Tối ưu thêm alignment giữa slide và audio: kiểm tra điểm "
+                    f"{sig['alignment']:.2f}/1.0 và đảm bảo nội dung trên slide khớp "
+                    f"với những gì đang nói tại thời điểm đó."
+                )
+            elif norm >= 0.4:
+                slide_hint = (
+                    "Giảm số lượng slide và tập trung vào các ý chính, "
+                    "sử dụng biểu đồ hoặc sơ đồ"
+                    if sig["seg_count"] > 20
+                    else "Cải thiện bố cục slide"
+                )
+                suggestions.append(
+                    f"{slide_hint} thay vì nhiều chữ. "
+                    f"Điểm alignment hiện tại {sig['alignment']:.2f}/1.0."
+                )
+                suggestions.append(
+                    f"Thiết kế lại slide để làm nổi bật các khái niệm cốt lõi bằng "
+                    f"hình ảnh, biểu đồ, hoặc bảng so sánh trực quan "
+                    f"thay vì dùng quá nhiều bullet points."
+                )
+                suggestions.append(
+                    f"Đảm bảo mỗi slide đều có thông điệp chính liên kết trực tiếp "
+                    f"với nội dung đang trình bày tại thời điểm đó, "
+                    f"giúp tăng điểm alignment lên mức 0.7+."
+                )
+            else:
+                suggestions.append(
+                    f"Thiết kế lại toàn bộ slide từ đầu: giảm tối đa chữ trên slide "
+                    f"(mỗi slide tối đa 6 dòng, mỗi dòng tối đa 6 từ), "
+                    f"dùng nhiều hình ảnh, sơ đồ và biểu đồ để truyền tải thông tin. "
+                    f"Điểm alignment {sig['alignment']:.2f}/1.0 cho thấy slide hiện tại "
+                    f"chưa đồng bộ với nội dung audio."
+                )
+                suggestions.append(
+                    f"Tạo template slide đồng bộ cho toàn bộ bài trình bày: "
+                    f"dùng cùng một bảng màu, font chữ và kiểu bố cục để tạo "
+                    f"sự chuyên nghiệp và giúp khán giả dễ theo dõi."
+                )
+                suggestions.append(
+                    f"Rà soát lại nội dung trên từng slide để đảm bảo ngắn gọn, súc tích, "
+                    f"và dễ đọc. Mỗi slide nên trả lời được một câu hỏi "
+                    f"hoặc truyền tải một thông điệp rõ ràng."
+                )
+
+        # ── Voice Quality ────────────────────────────────────────
+        elif any(k in n for k in ("voice", "speech", "giọng", "delivery", "oral")):
+            if not sig["has_sq_data"]:
+                suggestions.append(
+                    f"Đảm bảo thiết bị ghi âm hoạt động tốt và thu âm trong môi trường yên tĩnh "
+                    f"cho các lần thuyết trình sau để có dữ liệu giọng nói phục vụ đánh giá."
+                )
+                suggestions.append(
+                    f"Luyện tập kỹ năng điều chỉnh giọng nói: nhấn mạnh từ khóa, "
+                    f"nghỉ đúng chỗ, tránh filler words (ừm, ạ, vâng) để tạo ấn tượng chuyên nghiệp."
+                )
+                suggestions.append(
+                    f"Thực hành thuyết trình trước gương hoặc ghi âm lại để tự nghe và "
+                    f"điều chỉnh ngữ điệu, tốc độ phù hợp với nội dung trình bày."
+                )
+            elif norm >= 0.7:
+                suggestions.append(
+                    f"Tiếp tục duy trì phong cách trình bày hiện tại: "
+                    f"trôi chảy ({sig['fluency']:.2f}/1.0), "
+                    f"phát âm rõ ({sig['clarity']:.2f}/1.0), "
+                    f"tự tin ({sig['confidence']:.2f}/1.0)."
+                )
+                suggestions.append(
+                    f"Tập thêm ngữ điệu nhấn mạnh ở những ý quan trọng để tăng sức thuyết phục."
+                )
+                suggestions.append(
+                    f"Thử thêm câu hỏi dẫn dắt hoặc tạm dừng có chủ đích (dramatic pause) "
+                    f"để khán giả có thời gian tiếp thu thông tin."
+                )
+            elif norm >= 0.4:
+                fs_note = f"điểm fluency {sig['fluency']:.2f}/1.0" if sig['fluency'] > 0 else "chưa có dữ liệu fluency"
+                suggestions.append(
+                    f"Tập trung cải thiện sự trôi chảy: {fs_note}, "
+                    f"{'cần giảm ngắt quãng và filler words bằng cách luyện tập trước gương nhiều hơn' if sig['fluency'] < 0.6 else 'trôi chảy ở mức trung bình, cần ổn định hơn'}."
+                )
+                if sig["clarity"] < 0.6:
+                    suggestions.append(
+                        f"Cải thiện độ rõ của giọng nói: phát âm từng từ rõ ràng hơn, "
+                        f"điểm clarity hiện tại chỉ {sig['clarity']:.2f}/1.0. "
+                        f"{'Giọng nói quá nhanh hoặc quá chậm đều ảnh hưởng đến sự tiếp thu.' if sig['speaking_rate'] > 0 else 'Chú ý tốc độ nói vừa phải.'}"
+                    )
+                # Speaking rate feedback
+                if sig["speaking_rate"] > 0:
+                    sr = sig["speaking_rate"]
+                    if sr < 100:
+                        suggestions.append(
+                            f"Tăng tốc độ nói: hiện tại {sr:.0f} syllables/min — hơi chậm, "
+                            f"nên đạt khoảng 120-150 syllables/min để giữ sự chú ý của khán giả."
+                        )
+                    elif sr > 180:
+                        suggestions.append(
+                            f"Giảm tốc độ nói: hiện tại {sr:.0f} syllables/min — khá nhanh, "
+                            f"nên chậm lại khoảng 120-150 syllables/min để khán giả dễ theo dõi."
+                        )
+                suggestions.append(
+                    f"Tăng sự tự tin khi trình bày: điểm confidence {sig['confidence']:.2f}/1.0. "
+                    f"Sử dụng ngôn ngữ cơ thể (tư thế, ánh mắt) để tự tin hơn khi đứng trước khán giả."
+                )
+            else:
+                suggestions.append(
+                    f"Ưu tiên luyện tập toàn bộ bài trình bày ít nhất 3-5 lần trước khi thuyết trình chính thức. "
+                    f"Hiện tại: fluency {sig['fluency']:.2f}/1.0, clarity {sig['clarity']:.2f}/1.0, "
+                    f"confidence {sig['confidence']:.2f}/1.0 — tất cả đều cần được cải thiện đáng kể."
+                )
+                if sig["hesitation"] > 3 or sig["hesitation_time"] > 5:
+                    suggestions.append(
+                        f"Giảm số lần ngập ngừng: hiện tại ghi nhận {sig['hesitation']} lần hesitation "
+                        f"(tổng {sig['hesitation_time']:.1f}s, tỉ lệ {sig['hesitation_rate']:.1f} lần/phút). "
+                        f"Sử dụng kỹ thuật 'pausing' có chủ đích (nghỉ 2-3 giây giữa các ý) "
+                        f"thay vì 'um', 'uh' để tạo sự chuyên nghiệp."
+                    )
+                if sig["speech_rhythm"] < 0.5:
+                    suggestions.append(
+                        f"Cải thiện nhịp điệu speech: điểm hiện tại {sig['speech_rhythm']:.2f}/1.0. "
+                        f"Thực hành thay đổi tốc độ và cao độ phù hợp với nội dung — nhanh khi hào hứng, "
+                        f"chậm khi nhấn mạnh điểm quan trọng."
+                    )
+                suggestions.append(
+                    f"Ghi âm lại bài trình bày và tự nghe lại để nhận diện những điểm yếu "
+                    f"về giọng nói cần cải thiện, sau đó tập trung sửa từng điểm đó."
+                )
+
+        # ── Structure / Organization ──────────────────────────────
+        elif any(k in n for k in ("structure", "organization", "cấu trúc", "logical")):
+            if norm >= 0.7:
+                suggestions.append("Giữ vững cấu trúc hiện tại, đảm bảo mỗi phần đều có mục đích rõ ràng.")
+            elif norm >= 0.4:
+                suggestions.append(
+                    f"Cải thiện luồng bài: mở đầu rõ ràng với overview, phát triển có trọng tâm, "
+                    f"kết luận mạnh. Sử dụng các cụm từ chuyển tiếp (Transition) để liên kết các phần."
+                )
+                suggestions.append(
+                    f"Áp dụng mô hình PREP (Point-Reason-Example-Point) hoặc STAR "
+                    f"(Situation-Task-Action-Result) cho từng phần trình bày để tăng tính logic."
+                )
+            else:
+                suggestions.append(
+                    f"Tái cấu trúc toàn bộ bài: xác định rõ 3-5 phần chính và đảm bảo "
+                    f"có luồng logic xuyên suốt từ đầu đến cuối. "
+                    f"Điểm overall {sig['overall']:.2f}/1.0 cho thấy bài trình bày thiếu sự liên kết."
+                )
+                suggestions.append(
+                    f"Dùng các cụm từ chuyển tiếp rõ ràng ('Tiếp theo', 'Bên cạnh đó', 'Do đó') "
+                    f"để dẫn dắt người nghe qua từng phần."
+                )
+
+        # ── Engagement ───────────────────────────────────────────
+        elif any(k in n for k in ("engagement", "tương tác", "interest", "hứng thú")):
+            if norm >= 0.7:
+                suggestions.append("Phát huy phong cách thu hút khán giả hiện tại, thử thêm các hoạt động tương tác mới.")
+            elif norm >= 0.4:
+                suggestions.append(
+                    f"Thêm câu hỏi dẫn dắt ('Các bạn có thấy điều này giống nhau không?'), "
+                    f"câu chuyện thực tế hoặc ví dụ gần gũi để tăng sự chú ý của khán giả."
+                )
+                suggestions.append(
+                    f"Sử dụng ngữ điệu và cử chỉ tay để duy trì sự hứng thú xuyên suốt bài trình bày."
+                )
+            else:
+                suggestions.append(
+                    f"Tạo điểm nhấn (highlight) xuyên suốt bài trình bày: câu chuyện thực tế, "
+                    f"số liệu bất ngờ, hoặc câu hỏi kích thích tư duy để khán giả không bị mất tập trung."
+                )
+                suggestions.append(
+                    f"Sử dụng ngữ điệu có高低 (giọng lên xuống), tốc độ thay đổi, "
+                    f"và tạm dừng có chủ đích để duy trì sự hứng thú."
+                )
+
+        # ── Generic ──────────────────────────────────────────────
+        if not suggestions:
+            if norm >= 0.7:
+                suggestions.append(
+                    f"Tiêu chí '{criteria_name}' đạt mức khá ({score:.1f}/{max_score:.0f}). "
+                    f"Cần duy trì và phát huy thêm."
+                )
+            elif norm >= 0.4:
+                suggestions.append(
+                    f"Cần cải thiện tiêu chí '{criteria_name}' (hiện tại {score:.1f}/{max_score:.0f}) "
+                    f"để nâng cao điểm tổng kết. Tham khảo rubric chi tiết của lớp."
+                )
+            else:
+                suggestions.append(
+                    f"Tiêu chí '{criteria_name}' cần được ưu tiên cải thiện ngay "
+                    f"(hiện tại {score:.1f}/{max_score:.0f}). Tham khảo rubric và đối chiếu "
+                    f"với bài trình bày thực tế để xác định điểm cần sửa."
+                )
+
+        return suggestions[:3]
 
     def _calculate_rubric_scores_fallback(
         self,
@@ -1409,8 +2128,14 @@ Return ONLY the JSON object. No markdown, no explanation."""
                     'score': score,
                     'maxScore': max_score,
                     'weight': weight,
-                    'comment': 'Điểm được tính tự động do lỗi AI',
-                    'suggestions': ['Vui lòng chạy lại để có đánh giá chi tiết']
+                    'comment': self._build_fallback_comment(
+                        criteria_name, score, max_score, speech_quality,
+                        overall_scores, segment_analyses, analysis_results,
+                    ),
+                    'suggestions': self._build_fallback_suggestions(
+                        criteria_name, score, max_score, speech_quality,
+                        overall_scores, segment_analyses, analysis_results,
+                    ),
                 }
         
         weighted = self._weighted_overall_from_criteria(criterion_scores)
@@ -1418,29 +2143,19 @@ Return ONLY the JSON object. No markdown, no explanation."""
         base_os['overallScore'] = weighted
         base_os['rubricBased'] = True
 
-        # Build basic report content
-        report_content = f"""
-BÁO CÁO ĐÁNH GIÁ BÀI THUYẾT TRÌNH
+        report_content = self._build_vietnamese_report_summary(
+            weighted,
+            criterion_scores,
+            base_os,
+            rubric_criteria,
+            speech_quality,
+        )
 
-Điểm tổng kết (theo rubric): {weighted:.2f}/1.0
-
-Nội dung và độ chính xác: {overall_scores.get('contentRelevance', 0) if overall_scores else 0:.2f}/1.0
-Tương đồng ngữ nghĩa: {overall_scores.get('semanticSimilarity', 0) if overall_scores else 0:.2f}/1.0
-Tương thích Slide - Audio: {overall_scores.get('slideAlignment', 0) if overall_scores else 0:.2f}/1.0
-"""
-        
-        if speech_quality:
-            report_content += f"""
-Chất lượng giọng nói:
-- Fluency: {speech_quality.get('fluencyScore', 'N/A')}
-- Clarity: {speech_quality.get('clarityScore', 'N/A')}
-- Confidence: {speech_quality.get('confidenceScore', 'N/A')}
-"""
-        
         return {
             'criterion_scores': criterion_scores,
             'report_content': report_content,
-            'overall_scores': base_os
+            'overall_scores': base_os,
+            'reportBody': {},
         }
 
 

@@ -6,6 +6,7 @@ import json
 import os
 import hmac
 import hashlib
+import time
 import requests
 from typing import Dict, Any, List
 
@@ -21,7 +22,7 @@ class WebhookService:
     def __init__(self):
         self.base_url = os.getenv('WEBHOOK_URL', 'http://localhost:8080/api/v1')
         self.secret = os.getenv('WEBHOOK_SECRET')
-        self.timeout = 30
+        self.timeout = 300
         
     def _generate_signature(self, payload: str) -> str:
         """Generate HMAC signature for webhook payload"""
@@ -68,17 +69,39 @@ class WebhookService:
                 headers=headers,
                 timeout=self.timeout
             )
-            
+
             if response.status_code >= 200 and response.status_code < 300:
                 logger.info(f"Webhook sent successfully to {endpoint}")
                 return True
             else:
                 logger.warning(f"Webhook failed: {response.status_code} - {response.text}")
                 return False
-                
+
         except requests.RequestException as e:
             logger.error(f"Failed to send webhook: {e}")
             return False
+
+    def _send_webhook_with_retry(self, endpoint: str, payload: Dict[str, Any], max_retries: int = 3, retry_delay: int = 5) -> bool:
+        """
+        Send webhook request with retry logic.
+
+        Args:
+            endpoint: Webhook endpoint path
+            payload: Payload to send
+            max_retries: Maximum number of retry attempts
+            retry_delay: Delay between retries in seconds
+
+        Returns:
+            True if successful
+        """
+        for attempt in range(1, max_retries + 1):
+            if self._send_webhook(endpoint, payload):
+                return True
+            if attempt < max_retries:
+                logger.warning(f"Webhook retry {attempt}/{max_retries} in {retry_delay}s...")
+                time.sleep(retry_delay)
+        logger.error(f"Webhook failed after {max_retries} attempts")
+        return False
     
     def send_report_complete(
         self,
@@ -119,7 +142,7 @@ class WebhookService:
             'reportBody': report_body or {}
         }
 
-        return self._send_webhook('/webhooks/report-complete', payload)
+        return self._send_webhook_with_retry('/webhooks/report-complete', payload)
     
     def send_report_failed(
         self,
@@ -141,7 +164,7 @@ class WebhookService:
             'error': error_message,
             'errorDetails': error_details or {}
         }
-        return self._send_webhook('/webhooks/report-complete', payload)
+        return self._send_webhook_with_retry('/webhooks/report-complete', payload)
     
     def test_connection(self) -> bool:
         """Test webhook connectivity"""
