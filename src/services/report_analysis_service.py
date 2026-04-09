@@ -1042,20 +1042,40 @@ Return ONLY the JSON object. No markdown, no explanation."""
 
     @staticmethod
     def _weighted_overall_from_criteria(scores_dict: Dict[str, Any]) -> float:
-        """Overall 0–1 as simple average of normalized criterion scores (score/maxScore), divided by 3."""
-        normalized_scores = []
+        """Overall 0–1 as weighted average of normalized criterion scores (score/maxScore)."""
+        total_weighted_score = 0.0
+        total_weight = 0.0
+        
         for cs in (scores_dict or {}).values():
             max_v = float(cs.get("maxScore") or 100)
             sc = float(cs.get("score") or 0)
+            weight = float(cs.get("weight") or 0)
+            
             if max_v <= 0:
                 continue
-            normalized_scores.append(sc / max_v)
+                
+            normalized_score = sc / max_v
+            total_weighted_score += normalized_score * weight
+            total_weight += weight
 
-        if not normalized_scores:
-            return 0.0
+        if total_weight <= 0:
+            # Fallback to simple average if no weights provided
+            normalized_scores = []
+            for cs in (scores_dict or {}).values():
+                max_v = float(cs.get("maxScore") or 100)
+                sc = float(cs.get("score") or 0)
+                if max_v <= 0:
+                    continue
+                normalized_scores.append(sc / max_v)
+            
+            if not normalized_scores:
+                return 0.0
+            
+            average = sum(normalized_scores) / len(normalized_scores)
+            return min(1.0, max(0.0, average))
 
-        average = sum(normalized_scores) / len(normalized_scores)
-        return min(1.0, max(0.0, average))
+        result = total_weighted_score / total_weight
+        return min(1.0, max(0.0, result))
 
     def _build_vietnamese_report_summary(
         self,
