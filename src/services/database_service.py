@@ -796,6 +796,17 @@ class DatabaseService:
                     totalHesitationCount,
                     totalHesitationTime,
                     hesitationRate,
+                    speakingRate,
+                    speechRhythmScore,
+                    silenceRatio,
+                    pitchVariation,
+                    volumeVariation,
+                    audioDuration,
+                    pitchMean,
+                    pitchStd,
+                    energyMean,
+                    energyStd,
+                    voicedRatio,
                     createdAt
                 FROM SpeechQualityAnalyses
                 WHERE presentationId = %s

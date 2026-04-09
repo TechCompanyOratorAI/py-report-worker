@@ -25,3 +25,7 @@ class AnalysisError(ReportWorkerError):
 class ConfigurationError(ReportWorkerError):
     """Configuration error"""
     pass
+
+class QuotaExceededError(ReportWorkerError):
+    """AI quota/prompt token limit exceeded"""
+    pass

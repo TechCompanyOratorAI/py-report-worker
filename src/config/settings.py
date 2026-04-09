@@ -48,8 +48,8 @@ class Settings:
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
     OPENAI_MODEL = os.getenv('OPENAI_MODEL')
     OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL')
-    # GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-    # GEMINI_MODEL = os.getenv('GEMINI_MODEL')
+    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+    GEMINI_MODEL = os.getenv('GEMINI_MODEL')
     AI_PROVIDER = os.getenv('AI_PROVIDER', 'openai')
     
     # Logging Configuration
