@@ -134,7 +134,7 @@ class WebhookService:
             'jobId': job_id,
             'presentationId': presentation_id,
             'reportId': report_id,
-            'status': 'done',
+            'status': 'success',  # Consistent with ASR/Semantic workers ('done' was non-standard)
             'segmentAnalyses': segment_analyses or [],
             'overallScores': overall_scores or {},
             'rubricScores': rubric_scores or {},
