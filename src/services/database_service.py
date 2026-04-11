@@ -222,9 +222,7 @@ class DatabaseService:
                 INSERT INTO SegmentAnalyses (
                     segmentId,
                     slideId,
-                    configId,
                     analyzedAt,
-                    processingTimeMs,
                     relevanceScore,
                     semanticScore,
                     alignmentScore,
@@ -235,13 +233,12 @@ class DatabaseService:
                     suggestions,
                     topicKeywordsFound
                 ) VALUES (
-                    %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
             """, (
                 analysis.segment_id,
                 slide_id,
                 datetime.now(),
-                processing_time_ms,
                 analysis.relevance_score,
                 analysis.semantic_score,
                 analysis.alignment_score,
@@ -292,18 +289,13 @@ class DatabaseService:
                 # Update existing record
                 cursor.execute("""
                     UPDATE AnalysisResults SET
-                        configId = NULL,
                         overallScore = %s,
                         analyzedAt = %s,
-                        processingTimeSeconds = %s,
-                        aiModelVersion = %s,
                         status = 'done'
                     WHERE presentationId = %s
                 """, (
                     overall_scores.overall_score,
                     datetime.now(),
-                    processing_time_seconds,
-                    ai_model_version,
                     presentation_id
                 ))
                 result_id = existing[0]
@@ -313,21 +305,16 @@ class DatabaseService:
                 cursor.execute("""
                     INSERT INTO AnalysisResults (
                         presentationId,
-                        configId,
                         overallScore,
                         analyzedAt,
-                        processingTimeSeconds,
-                        aiModelVersion,
                         status
                     ) VALUES (
-                        %s, NULL, %s, %s, %s, %s, 'done'
+                        %s, %s, %s, 'done'
                     )
                 """, (
                     presentation_id,
                     overall_scores.overall_score,
-                    datetime.now(),
-                    processing_time_seconds,
-                    ai_model_version
+                    datetime.now()
                 ))
                 
                 result_id = cursor.lastrowid
@@ -361,8 +348,6 @@ class DatabaseService:
                     presentationId,
                     overallScore,
                     analyzedAt,
-                    processingTimeSeconds,
-                    aiModelVersion,
                     status
                 FROM AnalysisResults 
                 WHERE presentationId = %s
