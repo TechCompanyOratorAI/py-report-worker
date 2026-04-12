@@ -1149,7 +1149,8 @@ Chất lượng giọng nói:
         settings: Dict = None,
         course_name: str = None,
         course_description: str = None,
-        topic_requirements: str = None
+        topic_requirements: str = None,
+        speakers: List[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Calculate scores based on rubric criteria using AI
@@ -1224,11 +1225,29 @@ Chất lượng giọng nói:
 - Total Hesitations: {speech_quality.get('totalHesitationCount', 0)} times
 - Total Hesitation Time: {(speech_quality.get('totalHesitationTime') or 0):.1f}s
 - Hesitation Rate: {(speech_quality.get('hesitationRate') or 0):.2f} times/min
+- Spectral Centroid Mean (Timbre): {speech_quality.get('spectralCentroidMean', 'N/A')}
 {audio_info}
 """
-        
+
         if hesitation_patterns:
-            speech_text += f"- Hesitation Patterns: {len(hesitation_patterns)} patterns found\n"
+            speech_text += f"\n- Hesitation Patterns Detail ({len(hesitation_patterns)} patterns):\n"
+            # Show top 10 patterns to avoid context bloat
+            for p in hesitation_patterns[:10]:
+                ptype = p.get('patternType', 'unknown')
+                dur = p.get('duration', 0)
+                desc = p.get('description', '')
+                speech_text += f"  * {ptype} at {p.get('startTime')}s, duration: {dur}s. {desc}\n"
+
+        if segment_speech_quality:
+            speech_text += f"\n- Segment Speech Quality (Summarized):\n"
+            # Just show segments with low confidence or high hesitation
+            for ssq in segment_speech_quality:
+                if (ssq.get('confidenceScore', 1) or 1) < 0.6 or (ssq.get('segmentHesitationCount', 0) or 0) > 2:
+                    issues = ssq.get('qualityIssues', '[]')
+                    if isinstance(issues, str):
+                        try: issues = json.loads(issues)
+                        except: issues = []
+                    speech_text += f"  * Segment {ssq.get('segmentId')}: Conf={ssq.get('confidenceScore')}, Hes={ssq.get('segmentHesitationCount')}. Issues: {', '.join(issues) if issues else 'None'}\n"
         
         # Prepare segment analysis summary
         segment_summary = ""
@@ -1244,7 +1263,26 @@ Chất lượng giọng nói:
 - Average Semantic Score: {avg_semantic:.2f}/1.0
 - Average Alignment Score: {avg_alignment:.2f}/1.0
 - Overall Score: {float(overall_scores.get('overallScore') or 0):.2f}/1.0
+
+### Dữ liệu cụ thể từng phân đoạn (Segment Details):
 """
+            # Add details for "interesting" segments (lowest scores or specific issues)
+            # Sort by total score ascending
+            sorted_segs = sorted(segment_analyses, key=lambda x: (x.get('relevanceScore', 1) or 1) + (x.get('semanticScore', 1) or 1) + (x.get('alignmentScore', 1) or 1))
+            
+            # Take top 10 worst/interesting segments to provide context
+            for sa in sorted_segs[:10]:
+                seg_id = sa.get('segmentId')
+                txt = sa.get('segmentText', '')[:100] + "..."
+                rel_expl = sa.get('relevanceExplanation', '')
+                mis_reason = sa.get('misalignmentReason', '')
+                status = sa.get('alignmentStatus', 'unknown')
+                
+                segment_summary += f"- Segment {seg_id} (Score: R:{sa.get('relevanceScore')}, S:{sa.get('semanticScore')}, A:{sa.get('alignmentScore')}):\n"
+                segment_summary += f"  * Text: \"{txt}\"\n"
+                if rel_expl: segment_summary += f"  * Relevance Expl: {rel_expl}\n"
+                if status != 'aligned': segment_summary += f"  * Alignment: {status} (Reason: {mis_reason})\n"
+                if sa.get('matchedConcepts'): segment_summary += f"  * Concepts: {sa.get('matchedConcepts')}\n"
         
         # Prepare AnalysisResults data
         analysis_results_text = ""
@@ -1282,6 +1320,18 @@ Chất lượng giọng nói:
         if topic_requirements:
             course_info += f"- Yêu cầu/Clearning outcomes: {topic_requirements}\n"
         
+        # Teamwork/Speakers info
+        teamwork_info = ""
+        if speakers and len(speakers) > 1:
+            teamwork_info = "## Dữ liệu về Nhóm & Người thuyết trình (Teamwork):\n"
+            for s in speakers:
+                label = s.get('aiSpeakerLabel', 'Unknown')
+                dur = s.get('totalDurationSeconds', 0)
+                segs = s.get('segmentCount', 0)
+                mapped = "Đã khớp SV" if s.get('isMapped') else "Chưa khớp"
+                teamwork_info += f"- Diễn giả {label}: Nói {dur:.1f}s, {segs} đoạn ({mapped})\n"
+            teamwork_info += "- Hãy đánh giá sự cân bằng trong việc phân chia thời lượng nói giữa các thành viên.\n"
+        
         # Create prompt for rubric-based scoring
         prompt = f"""Bạn là chuyên gia đánh giá bài thuyết trình. Hãy đánh giá bài thuyết trình này dựa trên rubric được cung cấp.
 
@@ -1294,6 +1344,7 @@ Chất lượng giọng nói:
 {segment_summary}
 ## Dữ liệu chất lượng giọng nói (Speech Quality):
 {speech_text if speech_text else "Chưa có dữ liệu phân tích giọng nói"}
+{teamwork_info if teamwork_info else ""}
 {analysis_results_text if analysis_results_text else ""}
 ## Rubric Criteria (Tiêu chí đánh giá):
 {rubric_text if rubric_text else "Không có rubric criteria"}

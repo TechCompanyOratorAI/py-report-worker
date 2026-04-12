@@ -259,21 +259,43 @@ class ReportWorker:
         # Step 3: Get speech quality data and analysis results
         logger.info(f"🎤 Loading speech quality and analysis data...")
         speech_quality = self.database_service.get_speech_quality_analysis(presentation_id)
+        if not speech_quality:
+            logger.warning(f"   ⚠️  Table [SpeechQualityAnalyses]: No data found for presentation {presentation_id}")
+
         hesitation_patterns = self.database_service.get_hesitation_patterns(presentation_id)
+        if not hesitation_patterns:
+            logger.info(f"   ℹ️  Table [HesitationPatterns]: No patterns found (this is normal if speech is clear)")
+
         segment_speech_quality = self.database_service.get_segment_speech_quality(presentation_id)
+        if not segment_speech_quality:
+            logger.warning(f"   ⚠️  Table [SegmentSpeechQuality]: No segment-level speech data found")
+
         analysis_results = self.database_service.get_analysis_results(presentation_id)
+        if not analysis_results:
+            logger.warning(f"   ⚠️  Table [AnalysisResults]: No overall analysis results found (quality metrics missing)")
         
-        logger.info(f"   - Speech Quality: {'Yes' if speech_quality else 'No'}")
-        logger.info(f"   - Hesitation Patterns: {len(hesitation_patterns) if hesitation_patterns else 0}")
-        logger.info(f"   - Segment Speech Quality: {len(segment_speech_quality) if segment_speech_quality else 0}")
-        logger.info(f"   - Analysis Results: {'Yes' if analysis_results else 'No'}")
+        # Check granular segment data presence
+        if segment_analyses:
+            has_relevance = any(sa.get('relevanceExplanation') for sa in segment_analyses)
+            has_alignment = any(sa.get('alignmentStatus') != 'unknown' for sa in segment_analyses)
+            if not has_relevance:
+                logger.warning(f"   ⚠️  Table [ContentRelevance]: No detailed relevance explanations found")
+            if not has_alignment:
+                logger.warning(f"   ⚠️  Table [AlignmentChecks]: No detailed alignment sync data found")
+
+        logger.info(f"   - Found {len(hesitation_patterns) if hesitation_patterns else 0} hesitation patterns")
+        logger.info(f"   - Found {len(segment_speech_quality) if segment_speech_quality else 0} segment speech records")
         
         # Step 4: Use rubric data from message or fetch from database
         if not rubric_data and effective_class_id:
             logger.info(f"📋 Loading rubric criteria for class {effective_class_id}...")
             rubric_criteria = self.database_service.get_class_rubric_criteria(effective_class_id)
+            if not rubric_criteria:
+                logger.error(f"   ❌ Table [ClassRubricCriteria]: No active criteria found for class {effective_class_id}!")
         else:
             rubric_criteria = rubric_data or []
+            if not rubric_criteria:
+                logger.warning("   ⚠️  No rubric criteria provided in message or found in DB. Report will use default scoring.")
         
         # Step 5: Calculate rubric-based scores using AI
         logger.info(f"🤖 Calculating rubric-based scores...")
@@ -297,7 +319,8 @@ class ReportWorker:
                     settings=settings,
                     course_name=presentation_data.course_name,
                     course_description=presentation_data.course_description,
-                    topic_requirements=presentation_data.topic_requirements
+                    topic_requirements=presentation_data.topic_requirements,
+                    speakers=presentation_data.speakers
                 )
 
                 # Extract reportBody for webhook
