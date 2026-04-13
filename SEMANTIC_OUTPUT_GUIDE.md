@@ -41,7 +41,7 @@ Report Worker đọc DB → LLM Prompt → AI Report
 |-------|------|---------|-----|--------------|-------|
 | `segmentId` | INT | FK tới `TranscriptSegments` | — | — | — |
 | `speakerLabel` | VARCHAR(50) | Label từ diarization (`SPEAKER_00`, `SPEAKER_01`...) | — | — | NULL nếu không có diarization |
-| `relevanceScore` | FLOAT | **Độ khớp đoạn nói vs chủ đề (topic)** | ≥ 0.6 | < 0.4 | 0.0–1.0, contrastive-normalised |
+| `relevanceScore` | FLOAT | ~~Độ khớp đoạn nói vs chủ đề (topic)~~ **Raw embedding similarity only — KHÔNG dùng để đánh giá content** | — | — | 🚫 Không đưa vào overallScore. LLM của report-worker tự đánh giá. |
 | `semanticScore` | FLOAT | **Độ khớp đoạn nói vs slide content** | ≥ 0.5 | < 0.25 | 0.0–1.0, contrastive-normalised |
 | `alignmentScore` | FLOAT | **Đúng thứ tự slide không** | ≥ 0.6 | < 0.3 | 35% timing + 65% content match |
 | `bestMatchingSlide` | INT | Virtual page slide khớp nhất | — | — | Từ PDF expansion |
@@ -49,13 +49,13 @@ Report Worker đọc DB → LLM Prompt → AI Report
 | `timingDeviation` | FLOAT | Độ lệch thời gian (giây) | ≈ 0 | > 30s | Dương = nói trễ slide |
 | `issues` | JSON | Danh sách vấn đề phát hiện | `[]` | Nhiều mục | Array of strings |
 | `suggestions` | JSON | Gợi ý cải thiện tương ứng | — | — | Array of strings |
-| `topicKeywordsFound` | JSON | Keywords topic xuất hiện trong đoạn nói | Nhiều | `[]` | Array of strings |
+| `topicKeywordsFound` | JSON | Keywords topic xuất hiện trong đoạn nói | Nhiều | `[]` | Tham khảo, không dùng để chấm điểm |
 
 **Aggregate per-speaker:**
 ```sql
 SELECT speakerLabel,
   COUNT(*) as segmentCount,
-  AVG(relevanceScore) as avgRelevance,
+  -- Không dùng AVG(relevanceScore) vì không đánh giá content quality
   AVG(semanticScore) as avgSemantic,
   AVG(alignmentScore) as avgAlignment
 FROM SegmentAnalyses sa
@@ -63,6 +63,11 @@ JOIN TranscriptSegments ts ON sa.segmentId = ts.segmentId
 JOIN Transcripts t ON ts.transcriptId = t.transcriptId
 WHERE t.presentationId = ? GROUP BY speakerLabel
 ```
+
+> [!IMPORTANT]
+> **`relevanceScore` KHÔNG được dùng để tính điểm tổng**. Đây là raw cosine similarity giữa embedding đoạn nói và embedding tên topic. Metric này **không có khả năng đánh giá được** người nói có thực sự bám sát nội dung chủ đề không. Ví dụ: topic "PYTHON BASIC 4" + câu nói bất kỳ bằng tiếng Việt sẽ cho score 0.7–0.8 do baseline inflation của multilingual embedding.
+>
+> **Content quality phải do LLM của report-worker tự đánh giá bằng cách đọc transcript thật.**
 
 ---
 
@@ -189,7 +194,46 @@ content_match   = cosine(segment, expected_slide_text), baseline-corrected ở 0
 
 ---
 
-## 11. Query Đầy Đủ Cho Per-Speaker Analysis
+## 11. ⚠️ Phân chia Trách Nhiệm — Rất Quan Trọng
+
+### Semantic Worker làm gì
+
+Semantic worker chỉ chịu trách nhiệm **phân tích kỹ thuật cấu trúc**:
+
+| Metric | Semantic Worker | Report Worker (LLM) |
+|--------|----------------|--------------------|
+| Slide content match (embedding) | ✅ Làm | ❌ Không làm |
+| Slide ordering alignment | ✅ Làm | ❌ Không làm |
+| Hesitation detection (audio) | ✅ Làm | ❌ Không làm |
+| Speech quality (fluency, clarity) | ✅ Làm | ❌ Không làm |
+| **Content relevance to topic** | 🚫 Raw data ONLY | ✅ **LLM tự đánh giá** |
+| Content quality & depth | ❌ Không làm | ✅ LLM tự đánh giá |
+| Narrative coherence | ❌ Không làm | ✅ LLM tự đánh giá |
+| Rubric-based scoring | ❌ Không làm | ✅ LLM tự đánh giá |
+
+### overallScore từ Semantic Worker
+
+```
+overallScore = 0.5 × semanticScore + 0.5 × alignmentScore
+             + 0.3 × speechQualityScore (nếu có)
+
+⚠️ contentRelevance (relevanceScore) KHÔNG có trong công thức này.
+```
+
+Score này chỉ phản ánh **quality kỹ thuật về presentation structure**, không phản ánh content quality.
+
+### Report Worker (LLM) phải tự làm
+
+Khi LLM nhận được data từ DB, cần:
+1. Đọc `segmentText` của từng segment (transcript thật)
+2. Đọc `topicName`, `topicDescription`, `topicRequirements` từ DB
+3. Tự đánh giá: người nói có bám sát chủ đề không? Nội dung có đúng không?
+4. Kết hợp với `rubricData` để chấm từng criteria
+5. KHÔNG tin tưởng `relevanceScore` từ semantic worker để đánh giá content
+
+---
+
+## 12. Query Đầy Đủ Cho Per-Speaker Analysis
 
 ```sql
 SELECT
@@ -223,7 +267,11 @@ ORDER BY ts.segmentNumber ASC
 
 ---
 
-## 12. Mapping Score → Nhận Xét Cho LLM
+## 13. Mapping Score → Nhận Xét Cho LLM
+
+> [!NOTE]
+> Bảng này chỉ áp dụng cho `semanticScore`, `alignmentScore`, và speech quality scores.
+> KHÔNG áp dụng cho `relevanceScore` (không đáng tin cậy).
 
 | Score | Nhận xét (tiếng Việt cho LLM) |
 |-------|-------------------------------|
@@ -235,7 +283,7 @@ ORDER BY ts.segmentNumber ASC
 
 ---
 
-## 13. Checklist Trước Khi Chạy Report Worker
+## 14. Checklist Trước Khi Chạy Report Worker
 
 - [ ] `SegmentAnalyses.speakerLabel` có data (presentation rerun sau migration 2026-04-13)
 - [ ] `SegmentSpeechQuality.segmentHesitationCount > 0` (presentation rerun sau fix 2026-04-13)
@@ -245,7 +293,7 @@ ORDER BY ts.segmentNumber ASC
 
 ---
 
-## 14. Fields KHÔNG Đưa Vào LLM Prompt
+## 15. Fields KHÔNG Đưa Vào LLM Prompt
 
 | Field | Lý do |
 |-------|-------|
@@ -255,5 +303,6 @@ ORDER BY ts.segmentNumber ASC
 | `startTime`/`endTime` của hesitation | Chi tiết quá, dùng aggregate |
 | `processingTime` | Debug info |
 | `confidence` của hesitation | Internal scoring |
+| **`relevanceScore`** | ❌ Không đáng tin cậy — LLM tự đánh giá content từ transcript thật |
 
-**✅ Nên dùng:** Aggregated counts, averages, normalized scores (0–1), issues/suggestions arrays.
+**✅ Nên dùng:** Aggregated counts, averages của `semanticScore` + `alignmentScore`, speech quality scores, `segmentText` (transcript thật để LLM đọc), `issues`/`suggestions` arrays.
