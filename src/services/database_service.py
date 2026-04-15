@@ -371,49 +371,52 @@ class DatabaseService:
             
             result_id = result.get('resultId')
             
-            # Get ContentQuality
-            cursor.execute("""
-                SELECT coherenceScore, depthScore, accuracyScore, topicCoverageScore, strengths, weaknesses
-                FROM ContentQuality WHERE resultId = %s
-            """, (result_id,))
-            content_quality = cursor.fetchone()
+            # Commented out legacy quality tables to avoid "Table not found" errors
+            # These are now superseded by the rubric scoring system
             
-            # Get DeliveryQuality
-            cursor.execute("""
-                SELECT clarityScore, pronunciationScore, volumeConsistency, speechRateWpm, voiceQuality
-                FROM DeliveryQuality WHERE resultId = %s
-            """, (result_id,))
-            delivery_quality = cursor.fetchone()
+            # # Get ContentQuality
+            # cursor.execute("""
+            #     SELECT coherenceScore, depthScore, accuracyScore, topicCoverageScore, strengths, weaknesses
+            #     FROM ContentQuality WHERE resultId = %s
+            # """, (result_id,))
+            # content_quality = cursor.fetchone()
             
-            # Get StructureQuality
-            cursor.execute("""
-                SELECT organizationScore, transitionQuality, introConclusionScore, logicalFlowScore, structureNotes
-                FROM StructureQuality WHERE resultId = %s
-            """, (result_id,))
-            structure_quality = cursor.fetchone()
+            # # Get DeliveryQuality
+            # cursor.execute("""
+            #     SELECT clarityScore, pronunciationScore, volumeConsistency, speechRateWpm, voiceQuality
+            #     FROM DeliveryQuality WHERE resultId = %s
+            # """, (result_id,))
+            # delivery_quality = cursor.fetchone()
             
-            # Get EngagementMetric
-            cursor.execute("""
-                SELECT enthusiasmScore, variationScore, rhetoricalDeviceCount, emotionalTone
-                FROM EngagementMetrics WHERE resultId = %s
-            """, (result_id,))
-            engagement_metric = cursor.fetchone()
+            # # Get StructureQuality
+            # cursor.execute("""
+            #     SELECT organizationScore, transitionQuality, introConclusionScore, logicalFlowScore, structureNotes
+            #     FROM StructureQuality WHERE resultId = %s
+            # """, (result_id,))
+            # structure_quality = cursor.fetchone()
             
-            # Get SpeechPattern
-            cursor.execute("""
-                SELECT fillerWordCount, avgPauseDuration, longPauseCount, paceConsistency, fillerWordList
-                FROM SpeechPatterns WHERE resultId = %s
-            """, (result_id,))
-            speech_pattern = cursor.fetchone()
+            # # Get EngagementMetric
+            # cursor.execute("""
+            #     SELECT enthusiasmScore, variationScore, rhetoricalDeviceCount, emotionalTone
+            #     FROM EngagementMetrics WHERE resultId = %s
+            # """, (result_id,))
+            # engagement_metric = cursor.fetchone()
+            
+            # # Get SpeechPattern
+            # cursor.execute("""
+            #     SELECT fillerWordCount, avgPauseDuration, longPauseCount, paceConsistency, fillerWordList
+            #     FROM SpeechPatterns WHERE resultId = %s
+            # """, (result_id,))
+            # speech_pattern = cursor.fetchone()
             
             cursor.close()
             
-            # Combine all data
-            result['contentQuality'] = content_quality
-            result['deliveryQuality'] = delivery_quality
-            result['structureQuality'] = structure_quality
-            result['engagementMetric'] = engagement_metric
-            result['speechPattern'] = speech_pattern
+            # Combine all data (placeholders for commented out metrics)
+            result['contentQuality'] = None
+            result['deliveryQuality'] = None
+            result['structureQuality'] = None
+            result['engagementMetric'] = None
+            result['speechPattern'] = None
             
             return result
             

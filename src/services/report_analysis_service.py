@@ -1286,30 +1286,30 @@ Chất lượng giọng nói:
         
         # Prepare AnalysisResults data
         analysis_results_text = ""
-        if analysis_results:
-            ar = analysis_results
-            analysis_results_text = f"""
-## Dữ liệu từ AnalysisResults (Kết quả phân tích tổng hợp):
-- Overall Score: {ar.get('overallScore', 'N/A')}
-- Analyzed At: {ar.get('analyzedAt', 'N/A')}
-- AI Model Version: {ar.get('aiModelVersion', 'N/A')}
-- Status: {ar.get('status', 'N/A')}
-
-### Content Quality (Chất lượng nội dung):
-{self._format_quality_data(ar.get('contentQuality'), ['coherenceScore', 'depthScore', 'accuracyScore', 'topicCoverageScore', 'strengths', 'weaknesses'])}
-
-### Delivery Quality (Chất lượng trình bày):
-{self._format_quality_data(ar.get('deliveryQuality'), ['clarityScore', 'pronunciationScore', 'volumeConsistency', 'speechRateWpm', 'voiceQuality'])}
-
-### Structure Quality (Chất lượng cấu trúc):
-{self._format_quality_data(ar.get('structureQuality'), ['organizationScore', 'transitionQuality', 'introConclusionScore', 'logicalFlowScore', 'structureNotes'])}
-
-### Engagement Metrics (Tương tác):
-{self._format_quality_data(ar.get('engagementMetric'), ['enthusiasmScore', 'variationScore', 'rhetoricalDeviceCount', 'emotionalTone'])}
-
-### Speech Patterns (Mẫu giọng nói):
-{self._format_quality_data(ar.get('speechPattern'), ['fillerWordCount', 'avgPauseDuration', 'longPauseCount', 'paceConsistency', 'fillerWordList'])}
-"""
+        # if analysis_results:
+        #     ar = analysis_results
+        #     analysis_results_text = f"""
+        # ## Dữ liệu từ AnalysisResults (Kết quả phân tích tổng hợp):
+        # - Overall Score: {ar.get('overallScore', 'N/A')}
+        # - Analyzed At: {ar.get('analyzedAt', 'N/A')}
+        # - AI Model Version: {ar.get('aiModelVersion', 'N/A')}
+        # - Status: {ar.get('status', 'N/A')}
+        # 
+        # ### Content Quality (Chất lượng nội dung):
+        # {self._format_quality_data(ar.get('contentQuality'), ['coherenceScore', 'depthScore', 'accuracyScore', 'topicCoverageScore', 'strengths', 'weaknesses'])}
+        # 
+        # ### Delivery Quality (Chất lượng trình bày):
+        # {self._format_quality_data(ar.get('deliveryQuality'), ['clarityScore', 'pronunciationScore', 'volumeConsistency', 'speechRateWpm', 'voiceQuality'])}
+        # 
+        # ### Structure Quality (Chất lượng cấu trúc):
+        # {self._format_quality_data(ar.get('structureQuality'), ['organizationScore', 'transitionQuality', 'introConclusionScore', 'logicalFlowScore', 'structureNotes'])}
+        # 
+        # ### Engagement Metrics (Tương tác):
+        # {self._format_quality_data(ar.get('engagementMetric'), ['enthusiasmScore', 'variationScore', 'rhetoricalDeviceCount', 'emotionalTone'])}
+        # 
+        # ### Speech Patterns (Mẫu giọng nói):
+        # {self._format_quality_data(ar.get('speechPattern'), ['fillerWordCount', 'avgPauseDuration', 'longPauseCount', 'paceConsistency', 'fillerWordList'])}
+        # """
         
         # Build course info
         course_info = ""
@@ -1624,14 +1624,18 @@ Return ONLY the JSON object. No markdown, no explanation."""
         has_sq_data     = sq_overall > 0 or fluency > 0
 
         # Content quality từ AnalysisResults (nếu có)
-        cq = ar.get("contentQuality") or {}
-        accuracy = float(cq.get("accuracyScore", 0) or 0)
-        depth    = float(cq.get("depthScore", 0) or 0)
+        # cq = ar.get("contentQuality") or {}
+        # accuracy = float(cq.get("accuracyScore", 0) or 0)
+        # depth    = float(cq.get("depthScore", 0) or 0)
+        accuracy = 0.0
+        depth = 0.0
 
         # Slide quality từ AnalysisResults
-        dq = ar.get("deliveryQuality") or {}
-        voice_rate = float(dq.get("speechRateWpm", 0) or 0)
-        voice_qual = float(dq.get("voiceQuality", 0) or 0)
+        # dq = ar.get("deliveryQuality") or {}
+        # voice_rate = float(dq.get("speechRateWpm", 0) or 0)
+        # voice_qual = float(dq.get("voiceQuality", 0) or 0)
+        voice_rate = 0.0
+        voice_qual = 0.0
 
         # Lấy điểm theo category
         if any(k in n for k in ("content", "nội dung", "accuracy", "chính xác")):
