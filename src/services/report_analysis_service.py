@@ -277,7 +277,8 @@ Return ONLY the JSON object. No markdown, no code blocks."""
                 timing_deviation=float(result.get('timing_deviation', 0)),
                 issues=result.get('issues', []),
                 suggestions=result.get('suggestions', ['Good segment']),
-                topic_keywords_found=result.get('topic_keywords_found', topic_keywords[:5])
+                topic_keywords_found=result.get('topic_keywords_found', topic_keywords[:5]),
+                speaker_label=segment.get('speakerName', None)
             )
             
         except json.JSONDecodeError as e:
@@ -358,7 +359,8 @@ Return ONLY the JSON object. No markdown, no code blocks."""
             timing_deviation=round(timing_deviation, 2),
             issues=issues if issues else ["Good segment alignment"],
             suggestions=suggestions if suggestions else ["Continue with good practices"],
-            topic_keywords_found=keywords_found
+            topic_keywords_found=keywords_found,
+            speaker_label=segment.get('speakerName', None)
         )
     
     def _calculate_overall_scores(
@@ -419,7 +421,10 @@ Return ONLY the JSON object. No markdown, no code blocks."""
 
         all_issues = []
         all_suggestions = []
+        speaker_issues = {}
+        speaker_suggestions = {}
         for seg in segment_analyses:
+            speaker = seg.get('speakerLabel') or seg.get('speakerName') or 'Không xác định'
             issues = seg.get('issues', [])
             suggestions = seg.get('suggestions', [])
             if isinstance(issues, str):
@@ -434,10 +439,28 @@ Return ONLY the JSON object. No markdown, no code blocks."""
                     suggestions = []
             all_issues.extend(issues)
             all_suggestions.extend(suggestions)
+            
+            if speaker not in speaker_issues:
+                speaker_issues[speaker] = []
+                speaker_suggestions[speaker] = []
+            speaker_issues[speaker].extend(issues)
+            speaker_suggestions[speaker].extend(suggestions)
 
         from collections import Counter
         top_issues = Counter(all_issues).most_common(5)
         top_suggestions = Counter(all_suggestions).most_common(5)
+        
+        speaker_feedback_info = ""
+        if len(speaker_issues) > 1 or (len(speaker_issues) == 1 and list(speaker_issues.keys())[0] != 'Không xác định'):
+            speaker_feedback_info = "Chi tiết đánh giá theo từng người nói:"
+            for speaker in speaker_issues.keys():
+                top_spk_issues = Counter(speaker_issues[speaker]).most_common(3)
+                top_spk_sugg = Counter(speaker_suggestions[speaker]).most_common(3)
+                speaker_feedback_info += f"\n- {speaker}:"
+                if top_spk_issues:
+                    speaker_feedback_info += f"\n  + Vị trí chưa tốt chủ yếu: {', '.join([i[0] for i in top_spk_issues])}"
+                if top_spk_sugg:
+                    speaker_feedback_info += f"\n  + Cần cải thiện: {', '.join([s[0] for s in top_spk_sugg])}"
 
         slide_audio_compatibility = overall_scores.get('slideAlignment', 0) * 100
         topic_task_relevance = overall_scores.get('contentRelevance', 0) * 100
@@ -464,16 +487,18 @@ Thông tin bài thuyết trình:
 - Semantic Similarity: {overall_scores.get('semanticSimilarity', 0):.2f}/1.0
 - Slide Alignment: {overall_scores.get('slideAlignment', 0):.2f}/1.0
 
-Các vấn đề phổ biến nhất:
+Các vấn đề chung phổ biến nhất:
 {chr(10).join([f"- {issue[0]}" for issue in top_issues])}
 
-Các đề xuất cải thiện phổ biến nhất:
+Các đề xuất cải thiện chung:
 {chr(10).join([f"- {suggestion[0]}" for suggestion in top_suggestions])}
+
+{speaker_feedback_info}
 
 Hãy trả về JSON với các trường sau (KHÔNG có markdown, KHÔNG có giải thích):
 {{
   "rating": <điểm đánh giá từ 1-5>,
-  "comments": "<đoạn feedback tổng quan bằng tiếng Việt, khoảng 500-700 từ, xuống dòng rõ ràng>"
+  "comments": "<đoạn feedback tổng quát, bao gồm đánh giá rõ ràng cho phần trình bày của từng người nói (nếu có), khoảng 500-700 từ, xuống dòng rõ ràng>"
 }}
 
 Lưu ý:
@@ -1197,14 +1222,11 @@ Chất lượng giọng nói:
                 criteria_desc = criterion.get('criteriaDescription', criterion.get('criteria_description', ''))
                 weight = criterion.get('weight', 1.0)
                 max_score = criterion.get('maxScore', 10)
-                eval_guide = criterion.get('evaluationGuide', criterion.get('evaluation_guide', ''))
                 row_id = self._rubric_row_id(criterion)
-
                 rubric_text += f"""
 {idx}. criteriaId (bắt buộc giữ nguyên số này trong JSON): {row_id}
    - Tên: {criteria_name} (Trọng số: {weight}, Điểm tối đa: {max_score})
    - Mô tả: {criteria_desc}
-   - Hướng dẫn đánh giá: {eval_guide}
 """
         
         # Prepare speech quality data
@@ -1222,10 +1244,14 @@ Chất lượng giọng nói:
 - Speaking Rate: {speech_quality.get('speakingRate', 'N/A')} syllables/min
 - Speech Rhythm Score: {speech_quality.get('speechRhythmScore', 'N/A')}
 - Silence Ratio: {speech_quality.get('silenceRatio', 'N/A')}
+- Voiced Ratio: {speech_quality.get('voicedRatio', 'N/A')}
+- Pitch: Mean={speech_quality.get('pitchMean', 'N/A')}, Std={speech_quality.get('pitchStd', 'N/A')}, Variation={speech_quality.get('pitchVariation', 'N/A')}
+- Energy: Mean={speech_quality.get('energyMean', 'N/A')}, Std={speech_quality.get('energyStd', 'N/A')}, Volume Variation={speech_quality.get('volumeVariation', 'N/A')}
 - Total Hesitations: {speech_quality.get('totalHesitationCount', 0)} times
 - Total Hesitation Time: {(speech_quality.get('totalHesitationTime') or 0):.1f}s
 - Hesitation Rate: {(speech_quality.get('hesitationRate') or 0):.2f} times/min
 - Spectral Centroid Mean (Timbre): {speech_quality.get('spectralCentroidMean', 'N/A')}
+- Technical Info: FileSize={speech_quality.get('audioFileSize', 'N/A')} bytes, SampleRate={speech_quality.get('sampleRate', 'N/A')}Hz, Config={speech_quality.get('opensmileConfig', 'N/A')}
 {audio_info}
 """
 
@@ -1277,8 +1303,9 @@ Chất lượng giọng nói:
                 rel_expl = sa.get('relevanceExplanation', '')
                 mis_reason = sa.get('misalignmentReason', '')
                 status = sa.get('alignmentStatus', 'unknown')
+                speaker = sa.get('speakerLabel') or sa.get('speakerName') or 'Không xác định'
                 
-                segment_summary += f"- Segment {seg_id} (Score: R:{sa.get('relevanceScore')}, S:{sa.get('semanticScore')}, A:{sa.get('alignmentScore')}):\n"
+                segment_summary += f"- Segment {seg_id} (Speaker: {speaker}, Score: R:{sa.get('relevanceScore')}, S:{sa.get('semanticScore')}, A:{sa.get('alignmentScore')}):\n"
                 segment_summary += f"  * Text: \"{txt}\"\n"
                 if rel_expl: segment_summary += f"  * Relevance Expl: {rel_expl}\n"
                 if status != 'aligned': segment_summary += f"  * Alignment: {status} (Reason: {mis_reason})\n"
@@ -1322,15 +1349,56 @@ Chất lượng giọng nói:
         
         # Teamwork/Speakers info
         teamwork_info = ""
+        speaker_summary_text = ""
+        if segment_analyses:
+            speaker_analyses = {}
+            for sa in segment_analyses:
+                spk = sa.get('speakerLabel') or sa.get('speakerName') or 'Không xác định'
+                if spk not in speaker_analyses:
+                    speaker_analyses[spk] = {
+                        'issues': [],
+                        'suggestions': [],
+                        'scores': {'rel': [], 'sem': [], 'ali': []}
+                    }
+                
+                def ensure_list(val):
+                    if isinstance(val, str):
+                        try: return json.loads(val)
+                        except: return [val]
+                    return val or []
+
+                speaker_analyses[spk]['issues'].extend(ensure_list(sa.get('issues')))
+                speaker_analyses[spk]['suggestions'].extend(ensure_list(sa.get('suggestions')))
+                speaker_analyses[spk]['scores']['rel'].append(float(sa.get('relevanceScore', 0) or 0))
+                speaker_analyses[spk]['scores']['sem'].append(float(sa.get('semanticScore', 0) or 0))
+                speaker_analyses[spk]['scores']['ali'].append(float(sa.get('alignmentScore', 0) or 0))
+
+            from collections import Counter
+            speaker_summary_text = "## Chi tiết đánh giá theo từng người nói (Speaker-level feedback):\n"
+            for spk, data in speaker_analyses.items():
+                top_issues = [i[0] for i in Counter(data['issues']).most_common(3)]
+                top_suggestions = [s[0] for s in Counter(data['suggestions']).most_common(3)]
+                
+                avg_rel = sum(data['scores']['rel']) / len(data['scores']['rel']) if data['scores']['rel'] else 0
+                avg_sem = sum(data['scores']['sem']) / len(data['scores']['sem']) if data['scores']['sem'] else 0
+                avg_ali = sum(data['scores']['ali']) / len(data['scores']['ali']) if data['scores']['ali'] else 0
+                
+                speaker_summary_text += f"- **{spk}**:\n"
+                speaker_summary_text += f"  * Điểm TB: Nội dung {avg_rel:.2f}, Logic {avg_sem:.2f}, Slide {avg_ali:.2f}\n"
+                if top_issues:
+                    speaker_summary_text += f"  * Các vấn đề ghi nhận: {', '.join(top_issues)}\n"
+                if top_suggestions:
+                    speaker_summary_text += f"  * Gợi ý cụ thể: {', '.join(top_suggestions)}\n"
+
         if speakers and len(speakers) > 1:
-            teamwork_info = "## Dữ liệu về Nhóm & Người thuyết trình (Teamwork):\n"
+            teamwork_info = "## Dữ liệu về Nhóm & Người thuyết trình (Teamwork Summary):\n"
             for s in speakers:
                 label = s.get('aiSpeakerLabel', 'Unknown')
                 dur = s.get('totalDurationSeconds', 0)
                 segs = s.get('segmentCount', 0)
                 mapped = "Đã khớp SV" if s.get('isMapped') else "Chưa khớp"
                 teamwork_info += f"- Diễn giả {label}: Nói {dur:.1f}s, {segs} đoạn ({mapped})\n"
-            teamwork_info += "- Hãy đánh giá sự cân bằng trong việc phân chia thời lượng nói giữa các thành viên.\n"
+            teamwork_info += "- Hãy đánh giá sự cân bằng trong việc phân chia thời lượng trình bày và sự phối hợp giữa các thành viên.\n"
         
         # Create prompt for rubric-based scoring
         prompt = f"""Bạn là chuyên gia đánh giá bài thuyết trình. Hãy đánh giá bài thuyết trình này dựa trên rubric được cung cấp.
@@ -1342,6 +1410,8 @@ Chất lượng giọng nói:
 {course_info}
 ## Điểm phân tích từ Semantic Worker:
 {segment_summary}
+## Dữ liệu chi tiết theo từng người nói (Speaker Detail):
+{speaker_summary_text}
 ## Dữ liệu chất lượng giọng nói (Speech Quality):
 {speech_text if speech_text else "Chưa có dữ liệu phân tích giọng nói"}
 {teamwork_info if teamwork_info else ""}
@@ -1354,12 +1424,19 @@ Chất lượng giọng nói:
 - Mảng criterion_scores phải có đúng {rubric_count} phần tử (mỗi criteriaId xuất hiện đúng một lần)
 - Không gộp nhiều tiêu chí vào một phần tử; không bỏ sót Slide Quality / Voice Quality nếu rubric có các tên tương ứng
 
-## Yêu cầu:
+## Yêu cầu chính:
 1. Đánh giá từng tiêu chí trong rubric dựa trên dữ liệu phân tích
-2. Tính điểm cho mỗi tiêu chí (theo thang điểm tối đa của tiêu chí đó)
-3. Tính điểm tổng kết theo trọng số (overallScore thang 0–1)
-4. Viết nhận xét chi tiết cho từng tiêu chí (trong từng phần tử criterion_scores và trong reportContent)
-5. Đưa ra gợi ý cải thiện cho từng tiêu chí
+2. Tính điểm cho mỗi tiêu chí (theo thang điểm tối đa của tiêu chí đó) dựa trên bằng chứng thực tế từ Transcript và kết quả phân tích.
+3. Tính điểm tổng kết theo trọng số (overallScore thang 0–1).
+4. Viết nhận xét chi tiết cho từng tiêu chí (trong từng phần tử criterion_scores và trong reportContent).
+5. Đưa ra gợi ý cải thiện cho từng tiêu chí.
+6. **NGUYÊN TẮC CHẤM ĐIỂM NGHIÊM NGẶT (CRITICAL):**
+   - **Bằng chứng thực tế (Evidence-based):** AI chỉ được cho điểm nếu tìm thấy bằng chứng trong Transcript hoặc Slide. KHÔNG tự suy diễn hoặc cho điểm "khuyến khích".
+   - **Đúng trọng tâm (Topic Relevance):** Nếu nội dung người nói không khớp với `topicName` hoặc vi phạm các yêu cầu trong `criteriaDescription`, BẮT BUỘC phải cho điểm thấp (thậm chí 0-2 điểm) và nêu rõ lý do "Lạc đề" hoặc "Thiếu nội dung bắt buộc".
+   - **Thẳng thắn (Direct Feedback):** Nhận xét phải mang tính xây dựng nhưng không được né tránh khuyết điểm. Nếu nói tệ, hãy ghi rõ là tệ và chỉ ra tại sao.
+   - **Công bằng (Individual Fairness):** Phải phân biệt rõ ràng đóng góp của từng Speaker. Nếu SPEAKER_00 nói tốt nhưng SPEAKER_01 nói lạc đề, điểm số và nhận xét phải phản ánh đúng sự khác biệt này.
+7. **QUAN TRỌNG: Với mỗi tiêu chí, phải chỉ rõ ràng từng NGƯỜI NÓI cụ thể (ví dụ: SPEAKER_00, SPEAKER_01) nếu có sự khác biệt hiệu suất giữa các thành viên. Tránh nhận xét chung chung không chỉ danh nhân vật.**
+8. **Nhấn mạnh: Nếu một người nói không chịu trách nhiệm hay không tham gia tiêu chí nào đó, phải nêu rõ (ví dụ: "SPEAKER_02 không thực hiện vai trò trong tiêu chí này") để đảm bảo công bằng đánh giá.**
 
 ## Trả về JSON với format sau (KHÔNG có markdown, KHÔNG có giải thích):
 {{
@@ -1375,21 +1452,36 @@ Chất lượng giọng nói:
     }}
   ],
   "overallScore": <điểm tổng (0-1)>,
-  "reportBody": {{
+  "reportBody": {
     "summary": "<đoạn tổng quan ngắn gọn bài thuyết trình, 100-200 từ, tiếng Việt>",
-    "strengths": ["<điểm mạnh 1>", "<điểm mạnh 2>", "<điểm mạnh 3>"],
-    "weaknesses": ["<điểm cần cải thiện 1>", "<điểm cần cải thiện 2>", "<điểm cần cải thiện 3>"],
-    "suggestions": ["<gợi ý cụ thể 1>", "<gợi ý cụ thể 2>", "<gợi ý cụ thể 3>"]
-  }}
+    "speaker_feedback": [
+      {
+        "speaker": "<Tên người trình bày, vd: SPEAKER_00>",
+        "performance_summary": "<Tóm tắt ngắn gọn phần trình bày của người này>",
+        "individual_strengths": ["<điểm mạnh cá nhân 1>", "<điểm mạnh cá nhân 2>"],
+        "individual_weaknesses": ["<điểm cần cải thiện cá nhân 1>", "<điểm cần cải thiện cá nhân 2>"],
+        "individual_suggestions": ["<gợi ý cải thiện cá nhân 1>"]
+      }
+    ],
+    "strengths": ["<điểm mạnh chung của nhóm 1>", "<điểm mạnh chung của nhóm 2>"],
+    "weaknesses": ["<điểm cần cải thiện chung của nhóm 1>", "<điểm cần cải thiện chung của nhóm 2>"],
+    "suggestions": ["<gợi ý cải thiện chung của nhóm 1>", "<gợi ý cải thiện chung của nhóm 2>"]
+  }
+}
 }}
 
+
 Lưu ý:
-- reportBody phải là object có 4 trường: summary, strengths, weaknesses, suggestions (tất cả là text thuần, không có markdown)
-- strengths, weaknesses, suggestions phải là mảng string, mỗi phần tử là một câu hoàn chỉnh
-- summary: viết thành 1 đoạn văn liền, không xuống dòng giữa chừng
-- strengths: liệt kê những gì làm tốt (3-5 điểm)
-- weaknesses: liệt kê những gì cần cải thiện (3-5 điểm)
-- suggestions: gợi ý hành động cụ thể để cải thiện (3-5 điểm)
+- reportBody phải là object có 5 trường: summary, speaker_feedback, strengths, weaknesses, suggestions (tất cả là text thuần, không có markdown)
+- **speaker_feedback: BẮT BUỘC phải có một phần tử cho mỗi người nói (Speaker) xuất hiện trong dữ liệu phân tích. KHÔNG ĐƯỢC bỏ sót hoặc gộp nhiều người vào một phần tử. Mỗi phần tử speaker_feedback phải:**
+  * Nêu rõ tên diễn giả (ví dụ: "SPEAKER_00", "SPEAKER_01")
+  * Viết nhận xét cụ thể cho người đó (ví dụ: điểm mạnh, điểm yếu, gợi ý riêng)
+  * Đánh giá chi tiết về góp phần của từng thành viên trong từng tiêu chí nếu có sự chênh lệch
+  * Nếu một người nói không tham gia hoặc không chịu trách nhiệm cho một tiêu chí, phải ghi rõ điều đó
+- summary: viết thành một đoạn tổng quan ngắn gọn, tích hợp mô tả cân bằng giữa các thành viên (nếu là nhóm)
+- strengths: liệt kê những gì làm tốt (3-5 điểm), nêu rõ ai làm tốt nếu khác biệt
+- weaknesses: liệt kê những gì cần cải thiện (3-5 điểm), nêu rõ ai cần cải thiện nếu khác biệt
+- suggestions: gợi ý hành động cụ thể để nhóm/cá nhân cải thiện (3-5 điểm)
 
 ## Hướng dẫn đánh giá Speech Quality (Voice Quality):
 - fluencyScore: Độ trôi chảy (0-1) → cao = tốt
@@ -1408,8 +1500,12 @@ Lưu ý:
 
 - Sử dụng alignment / slide để đánh giá tiêu chí về slide
 - Sử dụng segment analyses để đánh giá tiêu chí về nội dung và độ liên quan
-- comment trong criterion_scores phải ngắn gọn (1-3 câu), tập trung vào tiêu chí đó
-- suggestions trong criterion_scores là gợi ý riêng cho từng tiêu chí (2-3 câu mỗi tiêu chí)
+- **comment trong criterion_scores phải ngắn gọn (1-3 câu), tập trung vào tiêu chí đó. BẮT BUỘC nêu tên diễn giả cụ thể (ví dụ: SPEAKER_00, SPEAKER_01, SPEAKER_02) nếu:**
+  * Tiêu chí đó có sự chênh lệch rõ rệt giữa các thành viên
+  * Có cá nhân nào làm cực tốt/cực tệ trong phần đó
+  * Có người không tham gia hoặc không chịu trách nhiệm cho tiêu chí này
+  * Muốn ghi nhận đóng góp riêng của từng thành viên
+- suggestions trong criterion_scores là gợi ý riêng cho từng tiêu chí, phải cụ thể (2-3 câu mỗi tiêu chí, nêu rõ cho ai nếu là gợi ý cụ thể cho một người)
 
 Return ONLY the JSON object. No markdown, no explanation."""
 
@@ -1452,7 +1548,8 @@ Return ONLY the JSON object. No markdown, no explanation."""
                 overall_scores,
                 speech_quality,
                 analysis_results,
-                rubric_criteria
+                rubric_criteria,
+                speaker_analyses
             )
         except Exception:
             logger.warning(f"AI rubric scoring failed, using fallback")
@@ -1461,7 +1558,8 @@ Return ONLY the JSON object. No markdown, no explanation."""
                 overall_scores,
                 speech_quality,
                 analysis_results,
-                rubric_criteria
+                rubric_criteria,
+                speaker_analyses
             )
 
         raw_cs = result.get('criterion_scores', [])
@@ -1476,23 +1574,46 @@ Return ONLY the JSON object. No markdown, no explanation."""
         report_content = ""
         if report_body:
             summary = report_body.get('summary', '')
+            speaker_feedback = report_body.get('speaker_feedback', [])
             strengths = report_body.get('strengths', [])
             weaknesses = report_body.get('weaknesses', [])
             suggestions = report_body.get('suggestions', [])
 
             lines = []
             if summary:
-                lines.append(f"TONG QUAN: {summary}")
+                lines.append(f"TỔNG QUAN: {summary}\n")
+            if speaker_feedback:
+                lines.append("ĐÁNH GIÁ CHI TIẾT THEO TỪNG THÀNH VIÊN:")
+                for sf in speaker_feedback:
+                    if isinstance(sf, dict):
+                        spk = sf.get('speaker', 'Unknown')
+                        perf = sf.get('performance_summary', '')
+                        i_strengths = sf.get('individual_strengths', [])
+                        i_weaknesses = sf.get('individual_weaknesses', [])
+                        i_sugg = sf.get('individual_suggestions', [])
+                        
+                        lines.append(f"👤 {spk}:")
+                        if perf:
+                            lines.append(f"  - Tóm tắt: {perf}")
+                        if i_strengths:
+                            lines.append(f"  - Điểm mạnh: {', '.join(i_strengths)}")
+                        if i_weaknesses:
+                            lines.append(f"  - Cần cải thiện: {', '.join(i_weaknesses)}")
+                        if i_sugg:
+                            lines.append(f"  - Gợi ý riêng: {', '.join(i_sugg)}")
+                        lines.append("") # Spacer between speakers
             if strengths:
-                lines.append("DIEM MANH:")
+                lines.append("ĐIỂM MẠNH:")
                 for s in strengths:
                     lines.append(f"- {s}")
+                lines.append("")
             if weaknesses:
-                lines.append("DIEM CAN CAI THIEN:")
+                lines.append("ĐIỂM CẦN CẢI THIỆN:")
                 for w in weaknesses:
                     lines.append(f"- {w}")
+                lines.append("")
             if suggestions:
-                lines.append("GOI Y:")
+                lines.append("GỢI Ý KHẮC PHỤC:")
                 for sg in suggestions:
                     lines.append(f"- {sg}")
             report_content = "\n".join(lines)
@@ -1693,12 +1814,43 @@ Return ONLY the JSON object. No markdown, no explanation."""
         overall_scores: Optional[Dict] = None,
         segment_analyses: Optional[List[Dict]] = None,
         analysis_results: Optional[Dict] = None,
+        speaker_analyses: Optional[Dict] = None,
     ) -> str:
         """Generate a meaningful comment referencing actual signal numbers (like AI output)."""
         sig = self._extract_signal(
             criteria_name, overall_scores, speech_quality,
             segment_analyses, analysis_results,
         )
+
+        # Identify interesting speakers for this criterion
+        spk_note = ""
+        if speaker_analyses and len(speaker_analyses) > 0:
+            best_spk = None
+            worst_spk = None
+            best_score = -1
+            worst_score = 2
+            
+            # Map criteria category to score key
+            cat_key = 'rel' # Default to relevance
+            n_lower = (criteria_name or "").lower()
+            if any(k in n_lower for k in ("slide", "powerpoint", "trang chiếu")): cat_key = 'ali'
+            elif any(k in n_lower for k in ("voice", "speech", "giọng")): cat_key = 'sem'
+            
+            for spk, data in speaker_analyses.items():
+                scores = data['scores'].get(cat_key, [])
+                if scores:
+                    avg = sum(scores) / len(scores)
+                    if avg > best_score:
+                        best_score = avg
+                        best_spk = spk
+                    if avg < worst_score:
+                        worst_score = avg
+                        worst_spk = spk
+            
+            if best_spk and worst_spk and best_spk != worst_spk and (best_score - worst_score) > 0.2:
+                spk_note = f" {best_spk} có biểu hiện tốt nhất, trong khi {worst_spk} cần nỗ lực hơn."
+            elif best_spk:
+                spk_note = f" Tiêu biểu là phần trình bày của {best_spk}."
         norm    = score / max_score if max_score else 0.0
         n       = (criteria_name or "").lower()
         seg_n   = sig["seg_count"]
@@ -1782,7 +1934,7 @@ Return ONLY the JSON object. No markdown, no explanation."""
                 return (
                     f"Không có dữ liệu phân tích giọng nói khả dụng để đánh giá tiêu chí này. "
                     f"Hệ thống ghi nhận trạng thái 'Chưa có dữ liệu phân tích giọng nói'. "
-                    f"Điểm số được để ở mức 0 do thiếu dữ liệu đầu vào để xử lý."
+                    f"Điểm số được để ở mức 0 do thiếu dữ liệu đầu vào để xử lý. {spk_note}"
                 )
             parts = []
             if sig["fluency"] >= 0.6:
@@ -1831,17 +1983,17 @@ Return ONLY the JSON object. No markdown, no explanation."""
             if norm >= 0.7:
                 return (
                     f"Chất lượng giọng nói khá tốt: {sq_text}.{rate_note}{hesit_note}{rhythm_note} "
-                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — người thuyết trình thể hiện sự chuẩn bị tốt."
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — người thuyết trình thể hiện sự chuẩn bị tốt.{spk_note}"
                 )
             elif norm >= 0.4:
                 return (
                     f"Giọng nói ở mức trung bình: {sq_text}.{rate_note}{hesit_note}{rhythm_note} "
-                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — cần cải thiện thêm trôi chảy và sự tự tin."
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — cần cải thiện thêm trôi chảy và sự tự tin.{spk_note}"
                 )
             else:
                 return (
                     f"Chất lượng giọng nói chưa đạt yêu cầu: {sq_text}.{rate_note}{hesit_note}{rhythm_note} "
-                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — đây là điểm cần được ưu tiên cải thiện."
+                    f"Điểm quy đổi {score:.1f}/{max_score:.0f} — đây là điểm cần được ưu tiên cải thiện.{spk_note}"
                 )
 
         # ── Structure / Organization ──────────────────────────────
@@ -2174,7 +2326,8 @@ Return ONLY the JSON object. No markdown, no explanation."""
         overall_scores: Dict,
         speech_quality: Dict,
         analysis_results: Dict = None,
-        rubric_criteria: List[Dict] = None
+        rubric_criteria: List[Dict] = None,
+        speaker_analyses: Dict = None
     ) -> Dict[str, Any]:
         """Fallback calculation if AI fails"""
         logger.info("🔄 Using fallback rubric scoring...")
@@ -2206,6 +2359,7 @@ Return ONLY the JSON object. No markdown, no explanation."""
                     'comment': self._build_fallback_comment(
                         criteria_name, score, max_score, speech_quality,
                         overall_scores, segment_analyses, analysis_results,
+                        speaker_analyses
                     ),
                     'suggestions': self._build_fallback_suggestions(
                         criteria_name, score, max_score, speech_quality,
