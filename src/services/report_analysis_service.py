@@ -1452,22 +1452,22 @@ Chất lượng giọng nói:
     }}
   ],
   "overallScore": <điểm tổng (0-1)>,
-  "reportBody": {
+  "reportBody": {{
     "summary": "<đoạn tổng quan ngắn gọn bài thuyết trình, 100-200 từ, tiếng Việt>",
     "speaker_feedback": [
-      {
+      {{
         "speaker": "<Tên người trình bày, vd: SPEAKER_00>",
         "performance_summary": "<Tóm tắt ngắn gọn phần trình bày của người này>",
         "individual_strengths": ["<điểm mạnh cá nhân 1>", "<điểm mạnh cá nhân 2>"],
         "individual_weaknesses": ["<điểm cần cải thiện cá nhân 1>", "<điểm cần cải thiện cá nhân 2>"],
         "individual_suggestions": ["<gợi ý cải thiện cá nhân 1>"]
-      }
+      }}
     ],
     "strengths": ["<điểm mạnh chung của nhóm 1>", "<điểm mạnh chung của nhóm 2>"],
     "weaknesses": ["<điểm cần cải thiện chung của nhóm 1>", "<điểm cần cải thiện chung của nhóm 2>"],
     "suggestions": ["<gợi ý cải thiện chung của nhóm 1>", "<gợi ý cải thiện chung của nhóm 2>"]
-  }
-}
+  }}
+}}
 }}
 
 
