@@ -148,7 +148,8 @@ class ReportWorker:
                 overall_scores=result['overallScores'],
                 rubric_scores=result.get('rubricScores'),
                 metadata=result['metadata'],
-                report_body=result.get('reportBody')
+                report_body=result.get('reportBody'),
+                report_content=result.get('reportContent')
             )
 
             # Delete message from queue
@@ -333,6 +334,7 @@ class ReportWorker:
                 if isinstance(report_body, dict) and report_body:
                     webhook_report_body = {
                         'summary': report_body.get('summary', ''),
+                        'speaker_feedback': report_body.get('speaker_feedback', []),
                         'strengths': report_body.get('strengths', []),
                         'weaknesses': report_body.get('weaknesses', []),
                         'suggestions': report_body.get('suggestions', [])
@@ -366,22 +368,6 @@ class ReportWorker:
         else:
             logger.info(f"   - Report Content: (empty)")
 
-        # Convert segment analyses to API format
-        segment_analyses_api = []
-        for analysis in segment_analyses:
-            segment_analyses_api.append({
-                'segmentId': analysis.get('segmentId'),
-                'relevanceScore': analysis.get('relevanceScore'),
-                'semanticScore': analysis.get('semanticScore'),
-                'alignmentScore': analysis.get('alignmentScore'),
-                'issues': analysis.get('issues'),
-                'suggestions': analysis.get('suggestions'),
-                'topicKeywordsFound': analysis.get('topicKeywordsFound'),
-                'bestMatchingSlide': analysis.get('bestMatchingSlide'),
-                'expectedSlideNumber': analysis.get('expectedSlideNumber'),
-                'timingDeviation': analysis.get('timingDeviation')
-            })
-        
         # Step 6: Save AIReport to database
         if effective_report_id:
             try:
@@ -411,11 +397,22 @@ class ReportWorker:
         logger.info(f"   📄 Segments Analyzed: {len(segment_analyses)}")
         logger.info(f"   🖼️  Slides: {len(presentation_data.slides)}")
 
+        # Build overall_scores for webhook – include weightedOverallScore so
+        # Node API's WebSocket emitter can display the score correctly on the frontend.
+        overall_score_value = overall_scores.get('overallScore', 0) if overall_scores else 0
+        webhook_overall_scores = {**(overall_scores or {}), 'weightedOverallScore': overall_score_value}
+
+        # NOTE: segmentAnalyses is intentionally sent as an empty list [].
+        # The SegmentAnalyses table was already populated by the semantic worker.
+        # Sending data here would cause Node API to overwrite those scores with
+        # zeroed-out values (updateOnDuplicate bug). The report worker is READ-ONLY
+        # with respect to that table.
         return {
-            'segmentAnalyses': segment_analyses_api,
-            'overallScores': overall_scores or {},
+            'segmentAnalyses': [],
+            'overallScores': webhook_overall_scores,
             'rubricScores': rubric_scores,
             'reportBody': webhook_report_body if 'webhook_report_body' in dir() else {},
+            'reportContent': report_content,
             'metadata': {
                 'totalSegments': len(segment_analyses),
                 'totalSlides': len(presentation_data.slides),

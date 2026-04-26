@@ -48,6 +48,7 @@ class SegmentAnalysisResult:
     suggestions: List[str]
     topic_keywords_found: List[str]
     processing_time_ms: Optional[int] = None
+    speaker_label: Optional[str] = None
 
 @dataclass
 class OverallScores:
@@ -241,9 +242,10 @@ class DatabaseService:
                     timingDeviation,
                     issues,
                     suggestions,
-                    topicKeywordsFound
+                    topicKeywordsFound,
+                    speakerLabel
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
             """, (
                 analysis.segment_id,
@@ -257,7 +259,8 @@ class DatabaseService:
                 analysis.timing_deviation,
                 json.dumps(analysis.issues, ensure_ascii=False),
                 json.dumps(analysis.suggestions, ensure_ascii=False),
-                json.dumps(analysis.topic_keywords_found, ensure_ascii=False)
+                json.dumps(analysis.topic_keywords_found, ensure_ascii=False),
+                analysis.speaker_label
             ))
             
             seg_analysis_id = cursor.lastrowid
@@ -588,7 +591,12 @@ class DatabaseService:
             # Get segment analyses
             cursor.execute("""
                 SELECT
+                    sa.segAnalysisId,
                     sa.segmentId,
+                    sa.slideId,
+                    sa.analyzedAt,
+                    sa.createdAt,
+                    sa.updatedAt,
                     sa.relevanceScore,
                     sa.semanticScore,
                     sa.alignmentScore,
@@ -598,19 +606,35 @@ class DatabaseService:
                     sa.issues,
                     sa.suggestions,
                     sa.topicKeywordsFound,
+                    -- Use speakerLabel from SegmentAnalyses if available,
+                    -- otherwise fall back to aiSpeakerLabel from Speakers via TranscriptSegments
+                    COALESCE(sa.speakerLabel, sp.aiSpeakerLabel) as speakerLabel,
                     ts.segmentText,
                     ts.startTimestamp,
                     ts.endTimestamp,
+                    ts.wordCount,
+                    ts.confidenceScore as asrConfidence,
+                    cr.relevanceId,
                     cr.relevanceScore as granularRelevanceScore,
                     cr.matchedConcepts,
                     cr.explanation as relevanceExplanation,
+                    cr.createdAt as relevanceCreatedAt,
+                    cr.updatedAt as relevanceUpdatedAt,
+                    ss.similarityId,
                     ss.similarityScore as granularSimilarityScore,
+                    ss.createdAt as similarityCreatedAt,
+                    ss.updatedAt as similarityUpdatedAt,
+                    ac.alignmentId,
                     ac.alignmentStatus,
                     ac.timingSyncScore,
-                    ac.misalignmentReason
+                    ac.misalignmentReason,
+                    ac.expectedSlideNumber as alignmentExpectedSlide,
+                    ac.createdAt as alignmentCreatedAt,
+                    ac.updatedAt as alignmentUpdatedAt
                 FROM SegmentAnalyses sa
                 JOIN TranscriptSegments ts ON sa.segmentId = ts.segmentId
                 JOIN Transcripts t ON ts.transcriptId = t.transcriptId
+                LEFT JOIN Speakers sp ON ts.speakerId = sp.speakerId
                 LEFT JOIN ContentRelevance cr ON sa.segAnalysisId = cr.segAnalysisId
                 LEFT JOIN SemanticSimilarity ss ON sa.segAnalysisId = ss.segAnalysisId
                 LEFT JOIN AlignmentChecks ac ON sa.segAnalysisId = ac.segAnalysisId
@@ -753,8 +777,7 @@ class DatabaseService:
                     criteriaDescription,
                     weight,
                     maxScore,
-                    displayOrder,
-                    evaluationGuide
+                    displayOrder
                 FROM ClassRubricCriteria
                 WHERE classId = %s AND isActive = 1
                 ORDER BY displayOrder ASC
@@ -801,22 +824,30 @@ class DatabaseService:
                     clarityScore,
                     confidenceScore,
                     overallScore,
-                    totalHesitationCount,
-                    totalHesitationTime,
-                    hesitationRate,
                     speakingRate,
-                    speechRhythmScore,
-                    silenceRatio,
-                    pitchVariation,
-                    volumeVariation,
-                    audioDuration,
                     pitchMean,
                     pitchStd,
                     energyMean,
                     energyStd,
+                    pitchVariation,
+                    volumeVariation,
+                    speechRhythmScore,
+                    silenceRatio,
                     voicedRatio,
                     spectralCentroidMean,
-                    audioFilename
+                    totalHesitationCount,
+                    totalHesitationTime,
+                    hesitationRate,
+                    audioDuration,
+                    audioFileSize,
+                    audioFilename,
+                    opensmileConfig,
+                    sampleRate,
+                    processingTime,
+                    mfccFeatures,
+                    analyzedAt,
+                    createdAt,
+                    updatedAt
                 FROM SpeechQualityAnalyses
                 WHERE presentationId = %s
                 ORDER BY createdAt DESC
@@ -892,6 +923,7 @@ class DatabaseService:
             cursor.execute("""
                 SELECT
                     ssa.id as segmentSpeechQualityId,
+                    ssa.speechAnalysisId,
                     ssa.segmentId,
                     ssa.segmentHesitationCount as hesitationCount,
                     ssa.segmentHesitationTime,
@@ -900,7 +932,9 @@ class DatabaseService:
                     ssa.qualitySuggestions,
                     ssa.segmentStartTime as startTimestamp,
                     ssa.segmentEndTime as endTimestamp,
-                    ssa.segmentDuration
+                    ssa.segmentDuration,
+                    ssa.createdAt,
+                    ssa.updatedAt
                 FROM SegmentSpeechQuality ssa
                 JOIN SpeechQualityAnalyses sq ON ssa.speechAnalysisId = sq.id
                 JOIN TranscriptSegments ts ON ssa.segmentId = ts.segmentId

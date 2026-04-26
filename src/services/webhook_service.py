@@ -112,7 +112,8 @@ class WebhookService:
         overall_scores: Dict[str, Any] = None,
         rubric_scores: Dict[str, Any] = None,
         metadata: Dict[str, Any] = None,
-        report_body: Dict[str, Any] = None
+        report_body: Dict[str, Any] = None,
+        report_content: str = None
     ) -> bool:
         """
         Send report completion webhook
@@ -126,6 +127,7 @@ class WebhookService:
             rubric_scores: Rubric-based scores
             metadata: Additional metadata
             report_body: Structured report body (summary, strengths, weaknesses, suggestions)
+            report_content: Formatted report content with detailed feedback
 
         Returns:
             True if successful
@@ -139,7 +141,8 @@ class WebhookService:
             'overallScores': overall_scores or {},
             'rubricScores': rubric_scores or {},
             'metadata': metadata or {},
-            'reportBody': report_body or {}
+            'reportBody': report_body or {},
+            'reportContent': report_content or ''
         }
 
         return self._send_webhook_with_retry('/webhooks/report-complete', payload)
