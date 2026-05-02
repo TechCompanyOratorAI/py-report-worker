@@ -1400,8 +1400,20 @@ Chất lượng giọng nói:
                 teamwork_info += f"- Diễn giả {label}: Nói {dur:.1f}s, {segs} đoạn ({mapped})\n"
             teamwork_info += "- Hãy đánh giá sự cân bằng trong việc phân chia thời lượng trình bày và sự phối hợp giữa các thành viên.\n"
         
+        # Determine report format instruction
+        report_format = (settings or {}).get('reportFormat', 'detailed')
+        format_instructions = {
+            'summary': "Báo cáo dạng tóm tắt tổng quan, bao quát các ý chính của toàn bộ bài thuyết trình.",
+            'detailed': "Báo cáo chi tiết, phân tích kỹ lưỡng từng tiêu chí và đóng góp của từng người."
+        }
+        format_desc = format_instructions.get(report_format, format_instructions['detailed'])
+
         # Create prompt for rubric-based scoring
         prompt = f"""Bạn là chuyên gia đánh giá bài thuyết trình. Hãy đánh giá bài thuyết trình này dựa trên rubric được cung cấp.
+
+### YÊU CẦU ĐỊNH DẠNG BÁO CÁO:
+**{format_desc}**
+**Lưu ý: Dù ở định dạng nào, bạn BẮT BUỘC phải dựa trên các tiêu chí (Rubric) được cung cấp để chấm điểm và nhận xét.**
 
 ## Thông tin bài thuyết trình:
 - Tiêu đề: {presentation_title}
