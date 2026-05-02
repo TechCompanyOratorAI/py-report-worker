@@ -1408,11 +1408,24 @@ Chất lượng giọng nói:
         }
         format_desc = format_instructions.get(report_format, format_instructions['detailed'])
 
+        # Get inclusion flags
+        include_summary = (settings or {}).get('includeOverallSummary', True)
+        include_suggestions = (settings or {}).get('includeSuggestions', True)
+        include_comments = (settings or {}).get('includeCriterionComments', True)
+
+        # Build prompt instructions for inclusion flags
+        inclusion_instructions = []
+        if not include_summary: inclusion_instructions.append("- KHÔNG tạo phần 'summary' trong reportBody.")
+        if not include_suggestions: inclusion_instructions.append("- KHÔNG tạo phần 'suggestions' trong reportBody hay trong từng tiêu chí.")
+        if not include_comments: inclusion_instructions.append("- KHÔNG tạo phần 'comment' trong từng tiêu chí.")
+        inclusion_text = "\n".join(inclusion_instructions)
+
         # Create prompt for rubric-based scoring
         prompt = f"""Bạn là chuyên gia đánh giá bài thuyết trình. Hãy đánh giá bài thuyết trình này dựa trên rubric được cung cấp.
 
 ### YÊU CẦU ĐỊNH DẠNG BÁO CÁO:
 **{format_desc}**
+{inclusion_text}
 **Lưu ý: Dù ở định dạng nào, bạn BẮT BUỘC phải dựa trên các tiêu chí (Rubric) được cung cấp để chấm điểm và nhận xét.**
 
 ## Thông tin bài thuyết trình:
@@ -1592,7 +1605,7 @@ Return ONLY the JSON object. No markdown, no explanation."""
             suggestions = report_body.get('suggestions', [])
 
             lines = []
-            if summary:
+            if summary and include_summary:
                 lines.append(f"TỔNG QUAN: {summary}\n")
             if speaker_feedback:
                 lines.append("ĐÁNH GIÁ CHI TIẾT THEO TỪNG THÀNH VIÊN:")
@@ -1611,7 +1624,7 @@ Return ONLY the JSON object. No markdown, no explanation."""
                             lines.append(f"  - Điểm mạnh: {', '.join(i_strengths)}")
                         if i_weaknesses:
                             lines.append(f"  - Cần cải thiện: {', '.join(i_weaknesses)}")
-                        if i_sugg:
+                        if i_sugg and include_suggestions:
                             lines.append(f"  - Gợi ý riêng: {', '.join(i_sugg)}")
                         lines.append("") # Spacer between speakers
             if strengths:
@@ -1624,7 +1637,7 @@ Return ONLY the JSON object. No markdown, no explanation."""
                 for w in weaknesses:
                     lines.append(f"- {w}")
                 lines.append("")
-            if suggestions:
+            if suggestions and include_suggestions:
                 lines.append("GỢI Ý KHẮC PHỤC:")
                 for sg in suggestions:
                     lines.append(f"- {sg}")
