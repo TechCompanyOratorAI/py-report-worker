@@ -362,9 +362,9 @@ class ReportWorker:
         if rubric_scores:
             logger.info(f"   - Rubric Scores: {list(rubric_scores.keys())}")
 
-        # Log report content
+        # Do not print the full report body to terminal/server logs; it can be very long.
         if report_content:
-            logger.info(f"📝 Report Content:\n{report_content}")
+            logger.info(f"📝 Report Content generated ({len(report_content)} chars)")
         else:
             logger.info(f"   - Report Content: (empty)")
 
@@ -396,6 +396,15 @@ class ReportWorker:
         logger.info(f"   ⭐ Overall Score: {overall_scores.get('overallScore', 0):.2f}/1.00")
         logger.info(f"   📄 Segments Analyzed: {len(segment_analyses)}")
         logger.info(f"   🖼️  Slides: {len(presentation_data.slides)}")
+        logger.info(
+            "AI_REPORT_DONE "
+            f"presentationId={presentation_id} "
+            f"reportId={effective_report_id} "
+            f"jobId={job_id} "
+            f"classId={effective_class_id} "
+            f"overallScore={overall_scores.get('overallScore', 0):.2f} "
+            f"model={getattr(self.report_service, 'model_name', 'report-worker-v1')}"
+        )
 
         # Build overall_scores for webhook – include weightedOverallScore so
         # Node API's WebSocket emitter can display the score correctly on the frontend.
