@@ -50,7 +50,10 @@ class Settings:
     OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL')
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
     GEMINI_MODEL = os.getenv('GEMINI_MODEL')
+    GEMINI_FALLBACK_MODELS = os.getenv('GEMINI_FALLBACK_MODELS', '')
     AI_PROVIDER = os.getenv('AI_PROVIDER', 'openai')
+    AI_MAX_RETRIES = int(os.getenv('AI_MAX_RETRIES') or 3)
+    AI_RETRY_BASE_DELAY_SECONDS = float(os.getenv('AI_RETRY_BASE_DELAY_SECONDS') or 2)
     
     # Logging Configuration
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')

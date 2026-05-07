@@ -7,6 +7,7 @@ calculating scores and generating issues/suggestions using AI (OpenAI or Gemini)
 
 import json
 import re
+import time
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 
@@ -72,40 +73,102 @@ class ReportAnalysisService:
             
             self.gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
             self.model_name = settings.GEMINI_MODEL
+            self.fallback_model_names = [
+                model.strip()
+                for model in (settings.GEMINI_FALLBACK_MODELS or "").split(",")
+                if model.strip() and model.strip() != self.model_name
+            ]
             logger.info(f"✅ Gemini AI initialized with model: {settings.GEMINI_MODEL}")
         else:
             raise AnalysisError(f"Invalid AI_PROVIDER: {self.ai_provider}. Use 'openai' or 'gemini'")
     
     def _call_ai(self, prompt: str) -> str:
-        """Call AI API based on configured provider"""
-        try:
-            if self.ai_provider == 'openai':
-                response = self.openai_client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                    max_tokens=200
-                )
-                return response.choices[0].message.content
-                
-            elif self.ai_provider == 'gemini':
-                response = self.gemini_client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt
-                )
-                return response.text
-                
-        except Exception as e:
-            err_str = str(e)
-            is_quota = (
-                "'code': 402" in err_str or
-                err_str.startswith("Error code: 402") or
-                (hasattr(e, 'status_code') and e.status_code == 402)
+        """Call AI API based on configured provider, retrying transient overloads."""
+        model_names = [self.model_name]
+        if self.ai_provider == 'gemini':
+            model_names.extend(getattr(self, 'fallback_model_names', []))
+
+        max_retries = max(1, int(settings.AI_MAX_RETRIES or 1))
+        base_delay = max(0.1, float(settings.AI_RETRY_BASE_DELAY_SECONDS or 1))
+        last_error = None
+
+        for model_name in model_names:
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return self._call_ai_once(prompt, model_name)
+                except Exception as e:
+                    err_str = str(e)
+                    if self._is_quota_error(e, err_str):
+                        raise QuotaExceededError(str(e)) from e
+
+                    last_error = e
+                    is_transient = self._is_transient_ai_error(e, err_str)
+                    if not is_transient or attempt >= max_retries:
+                        if is_transient and model_name != model_names[-1]:
+                            logger.warning(
+                                f"AI model {model_name} unavailable after {attempt} attempt(s), trying fallback model"
+                            )
+                            break
+                        logger.error(f"AI API call failed: {e}")
+                        raise
+
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"AI API transient error on model {model_name} "
+                        f"(attempt {attempt}/{max_retries}): {e}. Retrying in {delay:.1f}s"
+                    )
+                    time.sleep(delay)
+
+        if last_error:
+            logger.error(f"AI API call failed: {last_error}")
+            raise last_error
+        raise AnalysisError("AI call failed: no model configured")
+
+    def _call_ai_once(self, prompt: str, model_name: str) -> str:
+        """Call one AI model once."""
+        if self.ai_provider == 'openai':
+            response = self.openai_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=200
             )
-            if is_quota:
-                raise QuotaExceededError(str(e)) from e
-            logger.error(f"AI API call failed: {e}")
-            raise
+            return response.choices[0].message.content
+
+        if self.ai_provider == 'gemini':
+            response = self.gemini_client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            return response.text
+
+        raise AnalysisError(f"Invalid AI_PROVIDER: {self.ai_provider}")
+
+    @staticmethod
+    def _is_quota_error(error: Exception, err_str: str = "") -> bool:
+        err_str = err_str or str(error)
+        return (
+            "'code': 402" in err_str or
+            err_str.startswith("Error code: 402") or
+            (hasattr(error, 'status_code') and error.status_code == 402)
+        )
+
+    @staticmethod
+    def _is_transient_ai_error(error: Exception, err_str: str = "") -> bool:
+        err_str = err_str or str(error)
+        status_code = getattr(error, 'status_code', None)
+        return (
+            status_code in (429, 500, 502, 503, 504) or
+            "'code': 429" in err_str or
+            "'code': 500" in err_str or
+            "'code': 502" in err_str or
+            "'code': 503" in err_str or
+            "'code': 504" in err_str or
+            "UNAVAILABLE" in err_str or
+            "RESOURCE_EXHAUSTED" in err_str or
+            "high demand" in err_str.lower() or
+            "temporarily unavailable" in err_str.lower()
+        )
         
     def analyze_presentation(
         self, 
@@ -1042,7 +1105,7 @@ Return ONLY the JSON object. No markdown, no explanation."""
             max_score = float(criterion.get("maxScore") or 100)
             weight = float(criterion.get("weight") or 0)
             factor = self._heuristic_score_factor(name, overall_scores, speech_quality)
-            score = round(factor * max_score, 2)
+            score = self._calibrate_rubric_score(round(factor * max_score, 2), max_score)
             try:
                 cid_val = int(raw_id)
             except (TypeError, ValueError):
@@ -1063,6 +1126,47 @@ Return ONLY the JSON object. No markdown, no explanation."""
                 ),
             }
             logger.warning(f"   ↳ Filled missing rubric criterion id={key} ({name}) with heuristic score")
+        return scores_dict
+
+    @staticmethod
+    def _calibrate_rubric_score(score: float, max_score: float) -> float:
+        """Gently lift overly harsh AI rubric scores while preserving ranking."""
+        if max_score <= 0:
+            return score
+
+        norm = max(0.0, min(1.0, score / max_score))
+        if norm <= 0:
+            calibrated = 0.0
+        elif norm < 0.45:
+            calibrated = min(0.60, norm + 0.15)
+        elif norm < 0.70:
+            calibrated = min(0.78, norm + 0.10)
+        elif norm < 0.85:
+            calibrated = min(0.90, norm + 0.05)
+        else:
+            calibrated = norm
+
+        return round(calibrated * max_score, 2)
+
+    def _calibrate_criterion_scores(self, scores_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply moderate score calibration to all rubric criteria."""
+        for key, cs in (scores_dict or {}).items():
+            if not isinstance(cs, dict):
+                continue
+            try:
+                raw_score = float(cs.get("score") or 0)
+                max_score = float(cs.get("maxScore") or 100)
+            except (TypeError, ValueError):
+                continue
+
+            calibrated_score = self._calibrate_rubric_score(raw_score, max_score)
+            if calibrated_score > raw_score:
+                logger.info(
+                    f"   ↳ Calibrated rubric score criteriaId={key}: "
+                    f"{raw_score:.2f}/{max_score:.2f} -> {calibrated_score:.2f}/{max_score:.2f}"
+                )
+                cs["score"] = calibrated_score
+
         return scores_dict
 
     @staticmethod
@@ -1135,6 +1239,37 @@ Return ONLY the JSON object. No markdown, no explanation."""
             max_s = float(cs.get("maxScore") or 1) or 1.0
             norm = (score / max_s) if max_s else 0.0
             lines.append(f"{name}: {norm:.2f}/1.0")
+
+        if criterion_scores_dict:
+            lines.append("")
+            lines.append("ĐÁNH GIÁ CHI TIẾT THEO TIÊU CHÍ RUBRIC:")
+            for rid in ordered_keys:
+                cs = (criterion_scores_dict or {}).get(rid)
+                if not cs or not isinstance(cs, dict):
+                    continue
+
+                name = cs.get("criteriaName", "Tiêu chí")
+                score = float(cs.get("score") or 0)
+                max_s = float(cs.get("maxScore") or 1) or 1.0
+                norm = (score / max_s) if max_s else 0.0
+                comment = (cs.get("comment") or "").strip()
+                suggestions = cs.get("suggestions") or []
+
+                if isinstance(suggestions, str):
+                    try:
+                        suggestions = json.loads(suggestions)
+                    except Exception:
+                        suggestions = [suggestions]
+
+                lines.append("")
+                lines.append(f"- {name}: {score:.2f}/{max_s:.2f} ({norm:.2f}/1.0)")
+                if comment:
+                    lines.append(f"  Nhận xét: {comment}")
+                if suggestions:
+                    lines.append("  Gợi ý cải thiện:")
+                    for suggestion in suggestions[:4]:
+                        if suggestion:
+                            lines.append(f"  + {suggestion}")
 
         lines.append("")
         ds = dim_scores or {}
@@ -1450,15 +1585,15 @@ Chất lượng giọng nói:
 - Không gộp nhiều tiêu chí vào một phần tử; không bỏ sót Slide Quality / Voice Quality nếu rubric có các tên tương ứng
 
 ## Yêu cầu chính:
-1. Đánh giá từng tiêu chí trong rubric dựa trên dữ liệu phân tích
-2. Tính điểm cho mỗi tiêu chí (theo thang điểm tối đa của tiêu chí đó) dựa trên bằng chứng thực tế từ Transcript và kết quả phân tích.
+1. Đánh giá từng tiêu chí trong rubric dựa trên dữ liệu phân tích theo hướng cân bằng và xây dựng.
+2. Tính điểm cho mỗi tiêu chí (theo thang điểm tối đa của tiêu chí đó) dựa trên bằng chứng thực tế từ Transcript và kết quả phân tích. Nếu có cả điểm mạnh và điểm yếu, không được chỉ tập trung vào lỗi; hãy ghi nhận điểm tích cực để điểm số không bị quá thấp.
 3. Tính điểm tổng kết theo trọng số (overallScore thang 0–1).
 4. Viết nhận xét chi tiết cho từng tiêu chí (trong từng phần tử criterion_scores và trong reportContent).
 5. Đưa ra gợi ý cải thiện cho từng tiêu chí.
-6. **NGUYÊN TẮC CHẤM ĐIỂM NGHIÊM NGẶT (CRITICAL):**
+6. **NGUYÊN TẮC CHẤM ĐIỂM CÂN BẰNG (CRITICAL):**
    - **Bằng chứng thực tế (Evidence-based):** AI chỉ được cho điểm nếu tìm thấy bằng chứng trong Transcript hoặc Slide. KHÔNG tự suy diễn hoặc cho điểm "khuyến khích".
-   - **Đúng trọng tâm (Topic Relevance):** Nếu nội dung người nói không khớp với `topicName` hoặc vi phạm các yêu cầu trong `criteriaDescription`, BẮT BUỘC phải cho điểm thấp (thậm chí 0-2 điểm) và nêu rõ lý do "Lạc đề" hoặc "Thiếu nội dung bắt buộc".
-   - **Thẳng thắn (Direct Feedback):** Nhận xét phải mang tính xây dựng nhưng không được né tránh khuyết điểm. Nếu nói tệ, hãy ghi rõ là tệ và chỉ ra tại sao.
+   - **Đúng trọng tâm (Topic Relevance):** Nếu nội dung người nói không khớp với `topicName` hoặc vi phạm các yêu cầu trong `criteriaDescription`, hãy cho điểm thấp và nêu rõ lý do "Lạc đề" hoặc "Thiếu nội dung bắt buộc". Tuy nhiên nếu bài vẫn có phần nội dung đúng, có demo, hoặc có bằng chứng đạt một phần tiêu chí thì không được cho điểm quá thấp một cách cực đoan.
+   - **Thẳng thắn nhưng khích lệ (Direct + Constructive Feedback):** Nhận xét phải chỉ ra khuyết điểm rõ ràng, đồng thời ghi nhận nỗ lực và điểm làm được. Ưu tiên mức điểm trung bình-khá khi bài có dữ liệu đạt yêu cầu một phần, chỉ cho điểm rất thấp khi gần như không có bằng chứng đạt tiêu chí.
    - **Công bằng (Individual Fairness):** Phải phân biệt rõ ràng đóng góp của từng Speaker. Nếu SPEAKER_00 nói tốt nhưng SPEAKER_01 nói lạc đề, điểm số và nhận xét phải phản ánh đúng sự khác biệt này.
 7. **QUAN TRỌNG: Với mỗi tiêu chí, phải chỉ rõ ràng từng NGƯỜI NÓI cụ thể (ví dụ: SPEAKER_00, SPEAKER_01) nếu có sự khác biệt hiệu suất giữa các thành viên. Tránh nhận xét chung chung không chỉ danh nhân vật.**
 8. **Nhấn mạnh: Nếu một người nói không chịu trách nhiệm hay không tham gia tiêu chí nào đó, phải nêu rõ (ví dụ: "SPEAKER_02 không thực hiện vai trò trong tiêu chí này") để đảm bảo công bằng đánh giá.**
@@ -1472,8 +1607,8 @@ Chất lượng giọng nói:
       "score": <điểm đánh giá>,
       "maxScore": <điểm tối đa>,
       "weight": <trọng số>,
-      "comment": "<nhận xét chi tiết bằng tiếng Việt>",
-      "suggestions": ["<gợi ý 1>", "<gợi ý 2>"]
+      "comment": "<nhận xét chi tiết bằng tiếng Việt, 4-6 câu, nêu rõ bằng chứng số liệu và tên speaker liên quan>",
+      "suggestions": ["<gợi ý cụ thể 1>", "<gợi ý cụ thể 2>", "<gợi ý cụ thể 3>"]
     }}
   ],
   "overallScore": <điểm tổng (0-1)>,
@@ -1525,7 +1660,7 @@ Lưu ý:
 
 - Sử dụng alignment / slide để đánh giá tiêu chí về slide
 - Sử dụng segment analyses để đánh giá tiêu chí về nội dung và độ liên quan
-- **comment trong criterion_scores phải ngắn gọn (1-3 câu), tập trung vào tiêu chí đó. BẮT BUỘC nêu tên diễn giả cụ thể (ví dụ: SPEAKER_00, SPEAKER_01, SPEAKER_02) nếu:**
+- **comment trong criterion_scores phải đủ chi tiết (4-6 câu cho mỗi tiêu chí), tập trung vào tiêu chí đó nhưng phải có bằng chứng cụ thể từ dữ liệu. BẮT BUỘC nêu điểm số liên quan, chỉ số phân tích liên quan, tên diễn giả cụ thể (ví dụ: SPEAKER_00, SPEAKER_01, SPEAKER_02), và lý do vì sao điểm cao/thấp. Không viết nhận xét chung chung như "cần cải thiện" nếu không kèm bằng chứng. BẮT BUỘC nêu tên diễn giả cụ thể nếu:**
   * Tiêu chí đó có sự chênh lệch rõ rệt giữa các thành viên
   * Có cá nhân nào làm cực tốt/cực tệ trong phần đó
   * Có người không tham gia hoặc không chịu trách nhiệm cho tiêu chí này
@@ -1669,6 +1804,7 @@ Return ONLY the JSON object. No markdown, no explanation."""
             if len(criterion_scores_dict) > before:
                 logger.info(f"   ↳ After fill: {len(criterion_scores_dict)} criteria (AI returned {before})")
 
+        criterion_scores_dict = self._calibrate_criterion_scores(criterion_scores_dict)
         overall_score = self._weighted_overall_from_criteria(criterion_scores_dict)
 
         logger.info(f"✅ Rubric-based scoring complete: {len(criterion_scores_dict)} criteria in output")
@@ -2369,7 +2505,7 @@ Return ONLY the JSON object. No markdown, no explanation."""
                 max_score = float(criterion.get('maxScore') or 100)
                 weight = float(criterion.get('weight') or 0)
                 factor = self._heuristic_score_factor(criteria_name, overall_scores, speech_quality)
-                score = round(factor * max_score, 2)
+                score = self._calibrate_rubric_score(round(factor * max_score, 2), max_score)
                 try:
                     cid_val = int(criteria_id)
                 except (TypeError, ValueError):

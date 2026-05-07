@@ -21,9 +21,18 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 
 # Add handler to logger
-logger.addHandler(handler)
+if not logger.handlers:
+    logger.addHandler(handler)
 logger.setLevel(settings.LOG_LEVEL)
+logger.propagate = False
 
 def get_logger(name: str) -> logging.Logger:
     """Get logger instance"""
-    return logging.getLogger(name)
+    if not name or name == 'py-report-worker':
+        return logger
+
+    child_name = name if name.startswith('py-report-worker') else f'py-report-worker.{name}'
+    child_logger = logging.getLogger(child_name)
+    child_logger.setLevel(settings.LOG_LEVEL)
+    child_logger.propagate = True
+    return child_logger
