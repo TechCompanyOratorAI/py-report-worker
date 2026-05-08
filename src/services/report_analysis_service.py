@@ -564,9 +564,11 @@ Hãy trả về JSON với các trường sau (KHÔNG có markdown, KHÔNG có g
   "comments": "<đoạn feedback tổng quát, bao gồm đánh giá rõ ràng cho phần trình bày của từng người nói (nếu có), khoảng 500-700 từ, xuống dòng rõ ràng>"
 }}
 
-Lưu ý:
+Lưu ý quan trọng cho phần comments:
 - rating phải là số nguyên từ 1-5
-- comments phải là text tiếng Việt
+- comments phải là text tiếng Việt, diễn đạt tự nhiên, dễ hiểu.
+- TUYỆT ĐỐI KHÔNG liệt kê khô khan các con số điểm cụ thể (ví dụ: không viết "Fluency: 0.40/1.0", "Clarity: 0.5" hay lập bảng điểm).
+- Chỉ sử dụng các đánh giá định tính (tốt, khá, cần cải thiện, chưa đồng bộ, v.v.), hãy hiểu các con số điểm để đưa ra nhận định chuyên môn, không xuất trực tiếp các con số đó thành danh sách gây khó hiểu cho người dùng.
 
 Return ONLY the JSON object. No markdown, no explanation."""
 
@@ -1214,12 +1216,11 @@ Return ONLY the JSON object. No markdown, no explanation."""
         rubric_criteria: Optional[List[Dict]] = None,
         speech_quality: Optional[Dict] = None,
     ) -> str:
-        """Khối text chuẩn: tiêu đề, điểm rubric, từng tiêu chí (chuẩn hoá /1.0), 3 chỉ số semantic."""
+        """Khối text chuẩn: tiêu đề, điểm rubric tổng kết."""
         lines = [
             "BÁO CÁO ĐÁNH GIÁ BÀI THUYẾT TRÌNH",
             "",
             f"Điểm tổng kết (theo rubric): {weighted_overall:.2f}/1.0",
-            "",
         ]
         ordered_keys: List[str] = []
         if rubric_criteria:
@@ -1230,69 +1231,38 @@ Return ONLY the JSON object. No markdown, no explanation."""
         else:
             ordered_keys = list((criterion_scores_dict or {}).keys())
 
-        for rid in ordered_keys:
-            cs = (criterion_scores_dict or {}).get(rid)
-            if not cs or not isinstance(cs, dict):
-                continue
-            name = cs.get("criteriaName", "Tiêu chí")
-            score = float(cs.get("score") or 0)
-            max_s = float(cs.get("maxScore") or 1) or 1.0
-            norm = (score / max_s) if max_s else 0.0
-            lines.append(f"{name}: {norm:.2f}/1.0")
-
         if criterion_scores_dict:
-            lines.append("")
-            lines.append("ĐÁNH GIÁ CHI TIẾT THEO TIÊU CHÍ RUBRIC:")
-            for rid in ordered_keys:
-                cs = (criterion_scores_dict or {}).get(rid)
-                if not cs or not isinstance(cs, dict):
-                    continue
-
-                name = cs.get("criteriaName", "Tiêu chí")
-                score = float(cs.get("score") or 0)
-                max_s = float(cs.get("maxScore") or 1) or 1.0
-                norm = (score / max_s) if max_s else 0.0
-                comment = (cs.get("comment") or "").strip()
-                suggestions = cs.get("suggestions") or []
-
-                if isinstance(suggestions, str):
-                    try:
-                        suggestions = json.loads(suggestions)
-                    except Exception:
-                        suggestions = [suggestions]
-
+            has_comments = any((criterion_scores_dict.get(rid) or {}).get("comment") for rid in ordered_keys)
+            if has_comments:
                 lines.append("")
-                lines.append(f"- {name}: {score:.2f}/{max_s:.2f} ({norm:.2f}/1.0)")
-                if comment:
-                    lines.append(f"  Nhận xét: {comment}")
-                if suggestions:
-                    lines.append("  Gợi ý cải thiện:")
-                    for suggestion in suggestions[:4]:
-                        if suggestion:
-                            lines.append(f"  + {suggestion}")
+                lines.append("ĐÁNH GIÁ CHI TIẾT THEO TIÊU CHÍ RUBRIC:")
+                for rid in ordered_keys:
+                    cs = (criterion_scores_dict or {}).get(rid)
+                    if not cs or not isinstance(cs, dict):
+                        continue
 
-        lines.append("")
-        ds = dim_scores or {}
-        lines.append(
-            f"Nội dung và độ chính xác: {float(ds.get('contentRelevance', 0) or 0):.2f}/1.0"
-        )
-        lines.append(
-            f"Tương đồng ngữ nghĩa: {float(ds.get('semanticSimilarity', 0) or 0):.2f}/1.0"
-        )
-        lines.append(
-            f"Tương thích Slide - Audio: {float(ds.get('slideAlignment', 0) or 0):.2f}/1.0"
-        )
+                    name = cs.get("criteriaName", "Tiêu chí")
+                    comment = (cs.get("comment") or "").strip()
+                    suggestions = cs.get("suggestions") or []
 
-        text = "\n".join(lines)
-        if speech_quality:
-            text += f"""
+                    if isinstance(suggestions, str):
+                        try:
+                            suggestions = json.loads(suggestions)
+                        except Exception:
+                            suggestions = [suggestions]
 
-Chất lượng giọng nói:
-- Fluency: {speech_quality.get('fluencyScore', 'N/A')}
-- Clarity: {speech_quality.get('clarityScore', 'N/A')}
-- Confidence: {speech_quality.get('confidenceScore', 'N/A')}
-"""
-        return text
+                    if comment or suggestions:
+                        lines.append("")
+                        lines.append(f"- {name}:")
+                        if comment:
+                            lines.append(f"  Nhận xét: {comment}")
+                        if suggestions:
+                            lines.append("  Gợi ý cải thiện:")
+                            for suggestion in suggestions[:4]:
+                                if suggestion:
+                                    lines.append(f"  + {suggestion}")
+
+        return "\n".join(lines)
 
     def calculate_rubric_scores(
         self,
